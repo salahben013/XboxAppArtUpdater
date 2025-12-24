@@ -23,12 +23,12 @@ XboxAppArtUpdater is a Windows tool to scan, back up, and update third-party gam
 Quick Apply now includes automatic web search using Google Images. When enabled, it fetches game covers directly from the web without needing a SteamGridDB API key.
 
 **Important notes about web search:**
-- **Web results are NOT curated and may be wrong or low quality
-- **Results can be unpredictable and vary between searches
-- **You can choose 'Random' or select a specific result number
-- **First results (1-3) are usually more accurate than later ones
-- **Use specific result numbers for more consistent selection
-- **For best quality, use SteamGridDB sources instead
+- Web results are NOT curated and may be wrong or low quality
+- Results can be unpredictable and vary between searches
+- You can choose 'Random' or select a specific result number
+- First results (1-3) are usually more accurate than later ones
+- Use specific result numbers for more consistent selection
+- For best quality, use SteamGridDB sources instead
 
 ## How to Use This App
 
@@ -65,16 +65,16 @@ Quick Apply now includes automatic web search using Google Images. When enabled,
 
 ## QUICK START - AUTOMATED WEB SEARCH:
 
-    Quick Apply now includes automatic web search using Google Images.
-    When enabled, it fetches game covers directly from the web without
-    needing a SteamGridDB API key, you can also add the SteamGridDB as a source in this case the search choses randomly between the selected sources.
+- Quick Apply now includes automatic web search using Google Images.
+- When enabled, it fetches game covers directly from the web without
+- needing a SteamGridDB API key, you can also add the SteamGridDB as a source in this case the search choses randomly between the selected sources.
 
 ## IMPORTANT NOTES ABOUT WEB SEARCH:
-    - Web results are NOT curated and may be wrong or low quality
-    - Results can be unpredictable and vary between searches
-    - You can choose 'Random' or select a specific result number
-    - First results (1-3) are usually more accurate than later ones
-    - Use specific result numbers for more consistent selection
+- Web results are NOT curated and may be wrong or low quality
+- Results can be unpredictable and vary between searches
+- You can choose 'Random' or select a specific result number
+- First results (1-3) are usually more accurate than later ones
+- Use specific result numbers for more consistent selection
 
 ## Filters
 - **Store**: Filter by game store (Steam, Epic, GOG, Ubisoft)
