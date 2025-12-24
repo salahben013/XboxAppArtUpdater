@@ -66,8 +66,7 @@ Quick Apply now includes automatic web search using Google Images. When enabled,
 ## QUICK START - AUTOMATED WEB SEARCH:
 
 - Quick Apply now includes automatic web search using Google Images.
-- When enabled, it fetches game covers directly from the web without
-- needing a SteamGridDB API key, you can also add the SteamGridDB as a source in this case the search choses randomly between the selected sources.
+- When enabled, it fetches game covers directly from the web without needing a SteamGridDB API key, you can also add the SteamGridDB as a source in this case the search choses randomly between the selected sources.
 
 ## IMPORTANT NOTES ABOUT WEB SEARCH:
 - Web results are NOT curated and may be wrong or low quality
