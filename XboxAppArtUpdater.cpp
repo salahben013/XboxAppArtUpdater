@@ -561,7 +561,10 @@ struct GameEntry {
     std::wstring fileName;         // actual png filename if exists
     std::wstring expectedFileName; // expected filename derived from manifest id
     std::wstring title;            // resolved title if possible
+    std::wstring customTitle;      // user-set custom title (optional)
     bool hasArt = false;
+    // Helper: get display title (custom if set, else resolved)
+    std::wstring DisplayTitle() const { return !customTitle.empty() ? customTitle : title; }
 };
 static std::vector<GameEntry> gLastItems;
 static std::vector<GameEntry> gFilteredItems;  // Items after filtering
@@ -643,6 +646,9 @@ static HBITMAP gArtCurrentBitmap = nullptr;
 static HBITMAP gArtPreviewBitmap = nullptr;
 static int gArtSelectedIndex = -1;
 static std::wstring gArtGameId;  // Cached game ID for tab switching
+
+// Track if a custom title was changed in the manual art window
+static bool sCustomTitleChanged = false;
 
 // Tab indices for art types
 enum ArtType { ART_WEB = 0, ART_GRIDS = 1, ART_HEROES = 2, ART_LOGOS = 3, ART_ICONS = 4 };
@@ -2220,6 +2226,9 @@ static bool SaveCacheFile(const CacheState& st) {
         out += "fileName:" + WToJsString(e.fileName) + ",";
         out += "filePath:" + WToJsString(e.filePath) + ",";
         out += "title:" + WToJsString(e.title);
+        if (!e.customTitle.empty()) {
+            out += ",customTitle:" + WToJsString(e.customTitle);
+        }
         out += "}";
         if (i + 1 < st.items.size()) out += ",";
         out += "\n";
@@ -2311,9 +2320,10 @@ static bool LoadCacheFile(CacheState& st) {
 
     // games objects
     // Matches lines like:
-    // {store:"steam",id:"steam:123",expected:"steam_123.png",hasArt:true,fileName:"...",filePath:"...",title:"..."}
+    // {store:"steam",id:"steam:123",expected:"steam_123.png",hasArt:true,fileName:"...",filePath:"...",title:"...",...}
+    // Accepts extra fields (like customTitle) after title
     const std::regex objRe(
-        R"REGEX(\{\s*store:"([^"]*)",\s*id:"([^"]*)",\s*expected:"([^"]*)",\s*hasArt:(true|false),\s*fileName:"([^"]*)",\s*filePath:"([^"]*)",\s*title:"([^"]*)"\s*\})REGEX"
+        R"REGEX(\{\s*store:"([^"]*)",\s*id:"([^"]*)",\s*expected:"([^"]*)",\s*hasArt:(true|false),\s*fileName:"([^"]*)",\s*filePath:"([^"]*)",\s*title:"([^"]*)"((?:,[^}]*)?)\})REGEX"
     );
 
     auto beginIt = std::sregex_iterator(text.begin(), text.end(), objRe);
@@ -2321,7 +2331,7 @@ static bool LoadCacheFile(CacheState& st) {
 
     for (auto it = beginIt; it != endIt; ++it) {
         std::smatch m = *it;
-        if (m.size() < 8) continue;
+        if (m.size() < 9) continue;
 
         GameEntry e{};
         e.store = JsStringToW(m[1].str());
@@ -2331,7 +2341,13 @@ static bool LoadCacheFile(CacheState& st) {
         e.fileName = JsStringToW(m[5].str());
         e.filePath = JsStringToW(m[6].str());
         e.title = JsStringToW(m[7].str());
-
+        // Parse customTitle if present in the extra fields
+        std::string extras = m[8].str();
+        std::smatch m2;
+        std::regex customTitleRe(R"(customTitle:\"([^\"]*)\")");
+        if (std::regex_search(extras, m2, customTitleRe) && m2.size() >= 2) {
+            e.customTitle = JsStringToW(m2[1].str());
+        }
         st.items.push_back(std::move(e));
     }
 
@@ -2904,7 +2920,7 @@ static void PopulateListFromItems(const std::vector<GameEntry>& items) {
         const auto& e = gFilteredItems[idx];
         int imgIndex = GetImageIndexForPathOrPlaceholder(e.hasArt ? e.filePath : L"");
 
-        std::wstring gridLabel = !e.title.empty() ? e.title : e.idStr;
+        std::wstring gridLabel = !e.DisplayTitle().empty() ? e.DisplayTitle() : e.idStr;
         std::wstring listArtLabel = e.hasArt ? L"" : L"(missing)";
 
         LVITEM it{};
@@ -2919,7 +2935,7 @@ static void PopulateListFromItems(const std::vector<GameEntry>& items) {
         if (!gGridLayout) {
             ListView_SetItemText(gList, row, 1, (LPWSTR)e.store.c_str());
             ListView_SetItemText(gList, row, 2, (LPWSTR)e.idStr.c_str());
-            ListView_SetItemText(gList, row, 3, (LPWSTR)(e.title.empty() ? L"(unresolved)" : e.title.c_str()));
+            ListView_SetItemText(gList, row, 3, (LPWSTR)(e.DisplayTitle().empty() ? L"(unresolved)" : e.DisplayTitle().c_str()));
             ListView_SetItemText(gList, row, 4, (LPWSTR)(e.hasArt ? L"No" : L"Yes"));
 
             std::wstring fileCell = e.hasArt
@@ -5216,6 +5232,19 @@ static void ApplySelectedArt() {
         }
     }
 
+    // Always update customTitle from the field before saving
+    HWND hEdit = GetDlgItem(gArtWnd, 4100); // IDC_ART_TITLE_EDIT
+    if (hEdit) {
+        wchar_t titleBuf[256] = {};
+        GetWindowTextW(hEdit, titleBuf, _countof(titleBuf));
+        std::wstring newTitle = titleBuf;
+        for (auto& e : gLastItems) {
+            if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) {
+                e.customTitle = newTitle;
+                break;
+            }
+        }
+    }
     // Save cache and refresh
     SaveUiStateToCacheFile();
 
@@ -5376,6 +5405,98 @@ static void LoadSelectedPreview(int index) {
 }
 
 static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+
+        // Handle Save and Search button for title
+        static const int IDC_ART_TITLE_EDIT = 4100;
+        static const int IDC_ART_TITLE_SAVE_BTN = 4101;
+
+        if (msg == WM_COMMAND) {
+            int wmId = LOWORD(w);
+            if (wmId == IDC_ART_TITLE_SAVE_BTN) {
+                // Get text from the edit control
+                wchar_t titleBuf[256] = {};
+                HWND hEdit = GetDlgItem(hWnd, IDC_ART_TITLE_EDIT);
+                if (hEdit) {
+                    GetWindowTextW(hEdit, titleBuf, _countof(titleBuf));
+                    std::wstring newTitle = titleBuf;
+                    if (!newTitle.empty() && newTitle != gArtCurrentEntry.customTitle) {
+                        sCustomTitleChanged = true;
+                        // Save to config file in %TEMP%\XboxAppUpdaterArtCache\config.json
+                        wchar_t tempPath[MAX_PATH];
+                        GetTempPathW(MAX_PATH, tempPath);
+                        std::wstring configPath = tempPath;
+                        configPath += L"XboxAppUpdaterArtCache\\config.json";
+
+                        // Read the file
+                        FILE* f = _wfopen(configPath.c_str(), L"r, ccs=UTF-8");
+                        std::wstring fileContent;
+                        if (f) {
+                            wchar_t buf[4096];
+                            while (fgetws(buf, 4096, f)) fileContent += buf;
+                            fclose(f);
+                        }
+                        // Find the entry for the current game id and add/update customTitle
+                        std::wstring idKey = L"id:\"" + gArtCurrentEntry.idStr + L"\"";
+                        size_t pos = fileContent.find(idKey);
+                        if (pos != std::wstring::npos) {
+                            // Look for customTitle in this entry
+                            size_t entryEnd = fileContent.find(L"},", pos);
+                            if (entryEnd == std::wstring::npos) entryEnd = fileContent.find(L"}\n", pos);
+                            if (entryEnd == std::wstring::npos) entryEnd = fileContent.find(L"}\r\n", pos);
+                            if (entryEnd == std::wstring::npos) entryEnd = fileContent.find(L"}\r", pos);
+                            if (entryEnd == std::wstring::npos) entryEnd = fileContent.find(L"}", pos);
+                            if (entryEnd != std::wstring::npos) {
+                                size_t customTitlePos = fileContent.find(L"customTitle:", pos);
+                                if (customTitlePos != std::wstring::npos && customTitlePos < entryEnd) {
+                                    // Update existing customTitle
+                                    size_t valueStart = fileContent.find(L'"', customTitlePos);
+                                    if (valueStart != std::wstring::npos && valueStart < entryEnd) {
+                                        valueStart++;
+                                        size_t valueEnd = fileContent.find(L'"', valueStart);
+                                        if (valueEnd != std::wstring::npos && valueEnd < entryEnd) {
+                                            fileContent.replace(valueStart, valueEnd - valueStart, newTitle);
+                                        }
+                                    }
+                                } else {
+                                    // Insert new customTitle before the end of the entry
+                                    std::wstring insertStr = L",customTitle:\"" + newTitle + L"\"";
+                                    fileContent.insert(entryEnd, insertStr);
+                                }
+                            }
+                        }
+                        // Write back the file
+                        f = _wfopen(configPath.c_str(), L"w, ccs=UTF-8");
+                        if (f) {
+                            fputws(fileContent.c_str(), f);
+                            fclose(f);
+                        }
+
+                        gArtCurrentEntry.customTitle = newTitle;
+                        // Optionally update info label
+                        if (gArtInfoLabel) {
+                            std::wstring infoText = L"TITLE: " + gArtCurrentEntry.DisplayTitle() + L" (custom set)\r\n";
+                            infoText += L"Original title: ";
+                            if (!gArtCurrentEntry.title.empty())
+                                infoText += gArtCurrentEntry.title + L"\r\n";
+                            else
+                                infoText += L"(unable to resolve automatically)\r\n";
+                            infoText += L"STORE: " + gArtCurrentEntry.store + L"\r\n";
+                            infoText += L"ID: " + gArtCurrentEntry.idStr + L"\r\n";
+                            infoText += L"FILE: " + (gArtCurrentEntry.fileName.empty() ? gArtCurrentEntry.expectedFileName : gArtCurrentEntry.fileName) + L"\r\n";
+                            infoText += L"HAS ART: " + std::wstring(gArtCurrentEntry.hasArt ? L"Yes" : L"No");
+                            std::wstring fileName = gArtCurrentEntry.expectedFileName;
+                            if (fileName.empty()) fileName = ExpectedPngFromManifestId(gArtCurrentEntry.store, gArtCurrentEntry.idStr);
+                            bool hasBackup = HasBackup(gArtCurrentEntry.store, fileName);
+                            infoText += L"\r\nBACKUP: " + std::wstring(hasBackup ? L"Available" : L"None");
+                            SetWindowTextW(gArtInfoLabel, infoText.c_str());
+                        }
+                        // Start web art search (simulate click on web search or reload art)
+                        PostMessageW(hWnd, WM_USER + 1, 0, 0); // Triggers reload
+                    }
+                }
+                return 0;
+            }
+        }
     switch (msg) {
     case WM_CREATE: {
         HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -5392,6 +5513,25 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             hWnd, nullptr,
             GetModuleHandleW(nullptr), nullptr);
 
+
+        // --- Top right: Game Title Search and Save ---
+        static const int IDC_ART_TITLE_EDIT = 4100;
+        static const int IDC_ART_TITLE_SAVE_BTN = 4101;
+        HWND gArtTitleEdit = CreateWindowW(L"EDIT", (!gArtCurrentEntry.customTitle.empty() ? gArtCurrentEntry.customTitle.c_str() : (gArtCurrentEntry.title.empty() ? L"" : gArtCurrentEntry.title.c_str())),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            650, 10, 200, 24,
+            hWnd, (HMENU)(INT_PTR)IDC_ART_TITLE_EDIT,
+            GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(gArtTitleEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(gArtTitleEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Set game title...");
+
+        HWND gArtTitleSaveBtn = CreateWindowW(L"BUTTON", L"Save and Search",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            860, 10, 120, 24,
+            hWnd, (HMENU)(INT_PTR)IDC_ART_TITLE_SAVE_BTN,
+            GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(gArtTitleSaveBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+
         // Current art preview (we'll draw it ourselves)
         gArtCurrentImg = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | WS_BORDER,
@@ -5400,7 +5540,13 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             GetModuleHandleW(nullptr), nullptr);
 
         // Game info label (use ALL CAPS for field names to make them stand out)
-        std::wstring infoText = L"TITLE: " + (gArtCurrentEntry.title.empty() ? L"(unknown)" : gArtCurrentEntry.title) + L"\r\n";
+
+        std::wstring infoText = L"TITLE: " + (gArtCurrentEntry.DisplayTitle().empty() ? L"(unknown)" : gArtCurrentEntry.DisplayTitle()) + L"\r\n";
+        infoText += L"Original title: ";
+        if (!gArtCurrentEntry.title.empty())
+            infoText += gArtCurrentEntry.title + L"\r\n";
+        else
+            infoText += L"(unable to resolve automatically)\r\n";
         infoText += L"STORE: " + gArtCurrentEntry.store + L"\r\n";
         infoText += L"ID: " + gArtCurrentEntry.idStr + L"\r\n";
         infoText += L"FILE: " + (gArtCurrentEntry.fileName.empty() ? gArtCurrentEntry.expectedFileName : gArtCurrentEntry.fileName) + L"\r\n";
@@ -5638,6 +5784,18 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         // Info label takes full width minus current art preview and restore button
         if (gArtInfoLabel) MoveWindow(gArtInfoLabel, 145, 30, w - 145 - 140 - 12, 120, TRUE);
+
+        // Reposition title search field and button at top right
+        HWND hTitleEdit = GetDlgItem(hWnd, 4100);
+        HWND hTitleSaveBtn = GetDlgItem(hWnd, 4101);
+        int titleEditWidth = 200;
+        int titleBtnWidth = 120;
+        int spacing = 10;
+        int rightEdge = w - 12;
+        int btnLeft = rightEdge - titleBtnWidth;
+        int editLeft = btnLeft - spacing - titleEditWidth;
+        if (hTitleEdit) MoveWindow(hTitleEdit, editLeft, 10, titleEditWidth, 24, TRUE);
+        if (hTitleSaveBtn) MoveWindow(hTitleSaveBtn, btnLeft, 10, titleBtnWidth, 24, TRUE);
         
         // Status bar spans full width
         if (gArtStatus) MoveWindow(gArtStatus, 12, 205, w - 24, 20, TRUE);
@@ -6186,6 +6344,20 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 static void CloseArtWindow(bool applyChanges) {
     (void)applyChanges;
     if (!gArtWnd) return;
+
+    // If a custom title was set during this session, reload the cache and grid exactly as at startup
+    if (sCustomTitleChanged && gMainWnd) {
+        CacheState st;
+        if (LoadCacheFile(st)) {
+            gConfig = st.config;
+            gDarkMode = gConfig.darkMode;
+            ApplyCombosFromState(st);
+            RecreateListView(gMainWnd);
+            gLastItems = st.items;
+            PopulateListFromItems(gLastItems);
+        }
+        sCustomTitleChanged = false;
+    }
 
     // Cancel any loading in progress
     gArtCancelLoading = true;
