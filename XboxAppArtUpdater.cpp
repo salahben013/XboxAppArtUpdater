@@ -4,6 +4,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shlobj.h>
 
 #pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -28,6 +29,7 @@
 #include <queue>
 
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Winhttp.lib")
 #pragma comment(lib, "Gdiplus.lib")
 #pragma comment(lib, "Dwmapi.lib")
@@ -640,10 +642,13 @@ static HWND gArtInfoLabel = nullptr;
 static HWND gArtDebug = nullptr;
 static HWND gArtTab = nullptr;
 static HWND gArtConfigBtn = nullptr;
+static HWND gArtBrowseLocalBtn = nullptr;
 static GameEntry gArtCurrentEntry;
 static HIMAGELIST gArtImgList = nullptr;
 static HBITMAP gArtCurrentBitmap = nullptr;
 static HBITMAP gArtPreviewBitmap = nullptr;
+// Holds the path of a local image selected for preview but not yet applied
+static std::wstring gArtPendingLocalImagePath;
 static int gArtSelectedIndex = -1;
 static std::wstring gArtGameId;  // Cached game ID for tab switching
 
@@ -5412,6 +5417,30 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         if (msg == WM_COMMAND) {
             int wmId = LOWORD(w);
+            if (wmId == 12345) {
+                // Browse Local Image button clicked
+                OPENFILENAMEW ofn = { 0 };
+                wchar_t szFile[MAX_PATH] = { 0 };
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFile = szFile;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrFilter = L"Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.webp)\0*.png;*.jpg;*.jpeg;*.bmp;*.webp\0All Files (*.*)\0*.*\0";
+                ofn.nFilterIndex = 1;
+                ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+                if (GetOpenFileNameW(&ofn)) {
+                    // User picked a file, preview it only (do not apply yet)
+                    gArtPendingLocalImagePath = szFile;
+                    // Clear previous preview bitmap if any
+                    if (gArtPreviewBitmap) {
+                        DeleteObject(gArtPreviewBitmap);
+                        gArtPreviewBitmap = nullptr;
+                    }
+                    gArtPreviewBitmap = LoadPngToHBITMAP_AspectFit(gArtPendingLocalImagePath, 400);
+                    if (gArtPreviewImg) InvalidateRect(gArtPreviewImg, nullptr, TRUE);
+                }
+                return 0;
+            }
             if (wmId == IDC_ART_TITLE_SAVE_BTN) {
                 // Get text from the edit control
                 wchar_t titleBuf[256] = {};
@@ -5472,6 +5501,8 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                         }
 
                         gArtCurrentEntry.customTitle = newTitle;
+                        // Also update the main title so web search uses the new value
+                        gArtCurrentEntry.title = newTitle;
                         // Optionally update info label
                         if (gArtInfoLabel) {
                             std::wstring infoText = L"TITLE: " + gArtCurrentEntry.DisplayTitle() + L" (custom set)\r\n";
@@ -5531,6 +5562,14 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             hWnd, (HMENU)(INT_PTR)IDC_ART_TITLE_SAVE_BTN,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gArtTitleSaveBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // Browse Local Image button (placed just under Save and Search)
+        gArtBrowseLocalBtn = CreateWindowW(L"BUTTON", L"Browse Local Image",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            860, 35, 120, 24, // x, y, width, height (x matches Save and Search, y is just below)
+            hWnd, (HMENU)12345, // Unique ID for the browse button
+            GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(gArtBrowseLocalBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
         // Current art preview (we'll draw it ourselves)
         gArtCurrentImg = CreateWindowW(L"STATIC", L"",
@@ -5721,6 +5760,7 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             hWnd, (HMENU)(INT_PTR)IDC_ART_APPLY_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
+ 
         CreateWindowW(L"BUTTON", L"Cancel",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             610, 593, 110, 30,
@@ -5796,6 +5836,8 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         int editLeft = btnLeft - spacing - titleEditWidth;
         if (hTitleEdit) MoveWindow(hTitleEdit, editLeft, 10, titleEditWidth, 24, TRUE);
         if (hTitleSaveBtn) MoveWindow(hTitleSaveBtn, btnLeft, 10, titleBtnWidth, 24, TRUE);
+        // Move the browse button directly under Save and Search
+        if (gArtBrowseLocalBtn) MoveWindow(gArtBrowseLocalBtn, btnLeft, 40, titleBtnWidth, 24, TRUE);
         
         // Status bar spans full width
         if (gArtStatus) MoveWindow(gArtStatus, 12, 205, w - 24, 20, TRUE);
@@ -5975,7 +6017,18 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             return TRUE;
         }
         if (dis->CtlID == IDC_ART_PREVIEW_IMG) {
-            DrawArtPreview(dis->hDC, dis->rcItem, gArtPreviewBitmap, L"Select an image");
+            // If a local image is pending, preview it
+            HBITMAP previewBmp = nullptr;
+            if (!gArtPendingLocalImagePath.empty()) {
+                // If not already loaded, load it
+                if (!gArtPreviewBitmap) {
+                    gArtPreviewBitmap = LoadPngToHBITMAP_AspectFit(gArtPendingLocalImagePath, 400);
+                }
+                previewBmp = gArtPreviewBitmap;
+            } else {
+                previewBmp = gArtPreviewBitmap;
+            }
+            DrawArtPreview(dis->hDC, dis->rcItem, previewBmp, L"Select an image");
             return TRUE;
         }
         if (dis->CtlType == ODT_BUTTON) {
@@ -6222,6 +6275,72 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_COMMAND: {
         int id = LOWORD(w);
         if (id == IDC_ART_APPLY_BTN) {
+            // If a local image is pending, apply it
+            if (!gArtPendingLocalImagePath.empty()) {
+                std::wstring pickedPath = gArtPendingLocalImagePath;
+                std::wstring basePath = GetThirdPartyLibrariesPath();
+                fs::path storePath = fs::path(basePath) / gArtCurrentEntry.store;
+                std::wstring fileName = gArtCurrentEntry.expectedFileName;
+                if (fileName.empty()) fileName = ExpectedPngFromManifestId(gArtCurrentEntry.store, gArtCurrentEntry.idStr);
+                fs::path destPath = storePath / fileName;
+                if (!fs::exists(storePath)) fs::create_directories(storePath);
+                if (gArtCurrentEntry.hasArt && !gArtCurrentEntry.filePath.empty() && fs::exists(gArtCurrentEntry.filePath)) {
+                    BackupOriginalArt(gArtCurrentEntry.store, gArtCurrentEntry.filePath, fileName);
+                }
+                if (fs::exists(destPath)) {
+                    DWORD attrs = GetFileAttributesW(destPath.c_str());
+                    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+                        SetFileAttributesW(destPath.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                    }
+                }
+                try {
+                    fs::copy_file(pickedPath, destPath, fs::copy_options::overwrite_existing);
+                    SetFileReadOnly(destPath.wstring());
+                    gArtCurrentEntry.hasArt = true;
+                    gArtCurrentEntry.filePath = destPath.wstring();
+                    gArtCurrentEntry.fileName = fileName;
+                    // Update the entry in gLastItems
+                    for (auto& e : gLastItems) {
+                        if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) {
+                            e.hasArt = true;
+                            e.filePath = destPath.wstring();
+                            e.fileName = fileName;
+                            break;
+                        }
+                    }
+                    // Always update customTitle from the field before saving
+                    HWND hEdit = GetDlgItem(gArtWnd, 4100); // IDC_ART_TITLE_EDIT
+                    if (hEdit) {
+                        wchar_t titleBuf[256] = {};
+                        GetWindowTextW(hEdit, titleBuf, _countof(titleBuf));
+                        std::wstring newTitle = titleBuf;
+                        for (auto& e : gLastItems) {
+                            if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) {
+                                e.customTitle = newTitle;
+                                break;
+                            }
+                        }
+                    }
+                    // Save cache and refresh
+                    SaveUiStateToCacheFile();
+                    // Clear pending local image and preview bitmap
+                    gArtPendingLocalImagePath.clear();
+                    if (gArtPreviewBitmap) {
+                        DeleteObject(gArtPreviewBitmap);
+                        gArtPreviewBitmap = nullptr;
+                    }
+                    // Close the manual art window
+                    CloseArtWindow(false);
+                    // Refresh main list/grid
+                    DestroyImageList();
+                    EnsureImageList();
+                    PopulateListFromItems(gLastItems);
+                } catch (...) {
+                    DarkMessageBox(hWnd, L"Failed to copy the selected image.\n\nMake sure the file is not in use and you have permission to write to the destination.", L"Copy Failed", MB_OK | MB_ICONERROR);
+                }
+                return 0;
+            }
+            // Otherwise, apply web result as before
             ApplySelectedArt();
             return 0;
         }
