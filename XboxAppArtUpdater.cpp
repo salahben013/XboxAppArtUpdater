@@ -27,6 +27,7 @@
 #include <mutex>
 #include <atomic>
 #include <queue>
+#include <set>
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Comdlg32.lib")
@@ -77,6 +78,26 @@ static void DrawDarkButton(DRAWITEMSTRUCT* dis);
 
 using namespace Gdiplus;
 namespace fs = std::filesystem;
+
+// ------------------------------------------------------------
+// DPI scaling helpers
+// ------------------------------------------------------------
+static int DpiScale(int value, HWND hwnd = nullptr) {
+    UINT dpi = 96;
+    if (hwnd) {
+        dpi = GetDpiForWindow(hwnd);
+    } else {
+        dpi = GetDpiForSystem();
+    }
+    return MulDiv(value, dpi, 96);
+}
+
+static HFONT CreateDpiFont(HWND hwnd, int height = -14, int weight = FW_NORMAL, const wchar_t* face = L"Segoe UI") {
+    int scaledHeight = -DpiScale(abs(height), hwnd);
+    return CreateFontW(scaledHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+}
 
 // ------------------------------------------------------------
 // Globals / constants
@@ -140,6 +161,8 @@ struct QuickApplyConfig {
     bool useLogos = false;
     bool useIcons = false;
     bool hasShownQuickApplyIntro = false;  // Track if we've shown the intro dialog
+    bool keepFavorites = true;      // Reapply favorites instead of searching
+    bool favWithBackup = true;      // true = fallback to normal if fav missing; false = skip
 };
 static QuickApplyConfig gQuickApplyConfig;
 
@@ -160,6 +183,8 @@ static void DrawDarkButton(DRAWITEMSTRUCT* dis) {
     // Check if this is an "action" button that should be cyan blue
     bool isCyanButton = (dis->CtlID == 3006 ||   // IDC_CFG_OK_BTN
                          dis->CtlID == 4002 ||   // IDC_ART_APPLY_BTN
+                         dis->CtlID == 4020 ||   // IDC_ART_APPLY_FAV_BTN
+                         dis->CtlID == 4021 ||   // IDC_ART_SET_FAV_BTN
                          dis->CtlID == 1011);    // IDC_BTN_QUICK_APPLY
     
     // Colors
@@ -565,6 +590,9 @@ struct GameEntry {
     std::wstring title;            // resolved title if possible
     std::wstring customTitle;      // user-set custom title (optional)
     bool hasArt = false;
+    // Favorite art tracking
+    bool hasFavorite = false;         // true if user marked a favorite for this game
+    std::wstring favoriteWebUrl;      // URL if favorite was set from web/SteamGridDB image
     // Helper: get display title (custom if set, else resolved)
     std::wstring DisplayTitle() const { return !customTitle.empty() ? customTitle : title; }
 };
@@ -621,6 +649,8 @@ static const int IDC_ART_CLEAR_CACHE_BTN = 4014;
 static const int IDC_ART_WEB_RES_COMBO = 4015;
 static const int IDC_ART_WEB_PREV_BTN = 4016;
 static const int IDC_ART_WEB_NEXT_BTN = 4017;
+static const int IDC_ART_APPLY_FAV_BTN = 4020;
+static const int IDC_ART_SET_FAV_BTN   = 4021;
 
 static HWND gCfgWnd = nullptr;
 static HWND gCfgKeyEdit = nullptr;
@@ -649,6 +679,8 @@ static HBITMAP gArtCurrentBitmap = nullptr;
 static HBITMAP gArtPreviewBitmap = nullptr;
 // Holds the path of a local image selected for preview but not yet applied
 static std::wstring gArtPendingLocalImagePath;
+// Tracks the web URL of the last applied image (for setting as favorite later)
+static std::wstring gArtLastAppliedWebUrl;
 static int gArtSelectedIndex = -1;
 static std::wstring gArtGameId;  // Cached game ID for tab switching
 
@@ -672,6 +704,39 @@ static std::wstring gArtWebResolution = L"1024x1024";  // Current resolution sel
 static bool gArtIsLoading = false;      // True while loading thumbnails
 static bool gArtCancelLoading = false;  // Set to true to cancel current loading
 static int gArtLoadGeneration = 0;      // Incremented on each new load to detect stale loads
+static std::atomic<int> gArtFetchGeneration{0};  // Incremented on each tab switch/search to cancel stale fetches
+
+// Thumbnail loading state - heap-allocated so detached worker threads can safely access it
+struct ThumbLoadState {
+    struct Task {
+        size_t index;
+        std::wstring url;
+        int reportedW;
+        int reportedH;
+    };
+    struct Result {
+        size_t index;
+        HBITMAP hBitmap;
+        int origW;
+        int origH;
+    };
+    std::vector<Task> tasks;
+    std::mutex resultsMutex;
+    std::vector<Result> completedResults;
+    std::atomic<size_t> nextTask{0};
+    std::atomic<size_t> completedCount{0};
+    std::atomic<bool> cancelFlag{false};
+    int thumbSize = 128;
+    std::wstring gameIdForCache;
+    bool requireSquare = false;
+    int generation = 0;
+    size_t imageCount = 0;
+    size_t processedCount = 0;
+    std::vector<size_t> failedIndices;
+    std::set<size_t> loadedIndices;  // Tracks which gArtImages indices have loaded thumbnails
+};
+static std::shared_ptr<ThumbLoadState> gThumbState;
+static const UINT_PTR THUMB_TIMER_ID = 42;
 
 // Splitter for preview panel
 static int gArtSplitterPos = 200;  // Width of preview panel (from right edge)
@@ -991,6 +1056,43 @@ static bool BackupOriginalArt(const std::wstring& store, const std::wstring& ori
     return true; // Already have a backup
 }
 
+// Get the favorite art folder path
+static std::wstring GetFavoriteArtPath() {
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    fs::path exeDir = fs::path(exePath).parent_path();
+    return (exeDir / L"favoriteArt").wstring();
+}
+
+// Get the favorite file path for a specific game
+static std::wstring GetFavoriteFilePath(const std::wstring& store, const std::wstring& fileName) {
+    fs::path favDir = fs::path(GetFavoriteArtPath()) / store;
+    return (favDir / fileName).wstring();
+}
+
+// Check if a favorite image file exists on disk
+static bool HasFavoriteFile(const std::wstring& store, const std::wstring& fileName) {
+    if (fileName.empty()) return false;
+    return fs::exists(GetFavoriteFilePath(store, fileName));
+}
+
+// Save favorite art image to the favoriteArt folder
+static bool SaveFavoriteArt(const std::wstring& store, const std::wstring& sourcePath, const std::wstring& fileName) {
+    if (sourcePath.empty() || fileName.empty()) return false;
+    if (!fs::exists(sourcePath)) return false;
+
+    fs::path favDir = fs::path(GetFavoriteArtPath()) / store;
+    if (!fs::exists(favDir)) fs::create_directories(favDir);
+
+    fs::path favPath = favDir / fileName;
+    try {
+        fs::copy_file(sourcePath, favPath, fs::copy_options::overwrite_existing);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 // Restore all backed up art files and remove art that didn't exist before
 static int RestoreAllOriginalArt() {
     int restoredCount = 0;
@@ -1307,7 +1409,10 @@ static int DarkMessageBox(HWND hParent, const std::wstring& message, const std::
                 HWND hText = CreateWindowExW(0, L"STATIC", pData->message.c_str(),
                     WS_CHILD | WS_VISIBLE | SS_LEFT,
                     65, 20, width - 85, height - 80, hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-                SendMessageW(hText, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+                {
+                    HFONT hDpiFont = CreateDpiFont(hWnd);
+                    SendMessageW(hText, WM_SETFONT, (WPARAM)hDpiFont, TRUE);
+                }
                 
                 // Create buttons
                 int btnWidth = 80;
@@ -1416,8 +1521,9 @@ static int DarkMessageBox(HWND hParent, const std::wstring& message, const std::
     }
     
     // Calculate size based on message length
-    int dlgWidth = 400;
-    int dlgHeight = 160;
+    UINT sysDpiMsg = GetDpiForSystem();
+    int dlgWidth = MulDiv(400, sysDpiMsg, 96);
+    int dlgHeight = MulDiv(160, sysDpiMsg, 96);
     
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
@@ -2234,6 +2340,12 @@ static bool SaveCacheFile(const CacheState& st) {
         if (!e.customTitle.empty()) {
             out += ",customTitle:" + WToJsString(e.customTitle);
         }
+        if (e.hasFavorite) {
+            out += ",hasFavorite:true";
+            if (!e.favoriteWebUrl.empty()) {
+                out += ",favoriteWebUrl:" + WToJsString(e.favoriteWebUrl);
+            }
+        }
         out += "}";
         if (i + 1 < st.items.size()) out += ",";
         out += "\n";
@@ -2352,6 +2464,17 @@ static bool LoadCacheFile(CacheState& st) {
         std::regex customTitleRe(R"(customTitle:\"([^\"]*)\")");
         if (std::regex_search(extras, m2, customTitleRe) && m2.size() >= 2) {
             e.customTitle = JsStringToW(m2[1].str());
+        }
+        // Parse favorite fields
+        std::smatch m3;
+        std::regex favRe(R"(hasFavorite:(true|false))");
+        if (std::regex_search(extras, m3, favRe) && m3.size() >= 2) {
+            e.hasFavorite = (m3[1].str() == "true");
+        }
+        std::smatch m4;
+        std::regex favUrlRe(R"(favoriteWebUrl:\"([^\"]*)\")");
+        if (std::regex_search(extras, m4, favUrlRe) && m4.size() >= 2) {
+            e.favoriteWebUrl = JsStringToW(m4[1].str());
         }
         st.items.push_back(std::move(e));
     }
@@ -2496,7 +2619,8 @@ static void SetupListColumns(HWND lv) {
     c.cx = 360;            c.pszText = (LPWSTR)L"Game ID";     ListView_InsertColumn(lv, 2, &c);
     c.cx = 280;            c.pszText = (LPWSTR)L"Title";       ListView_InsertColumn(lv, 3, &c);
     c.cx = 110;            c.pszText = (LPWSTR)L"Missing art"; ListView_InsertColumn(lv, 4, &c);
-    c.cx = 260;            c.pszText = (LPWSTR)L"File";        ListView_InsertColumn(lv, 5, &c);
+    c.cx = 50;             c.pszText = (LPWSTR)L"Fav";         ListView_InsertColumn(lv, 5, &c);
+    c.cx = 260;            c.pszText = (LPWSTR)L"File";        ListView_InsertColumn(lv, 6, &c);
 }
 
 // ------------------------------------------------------------
@@ -2876,9 +3000,11 @@ static std::vector<GameEntry> ApplyFilters(const std::vector<GameEntry>& items) 
             if (gFilterStore == L"ubi" && e.store != L"ubi") continue;
         }
         
-        // Art filter: 0=all, 1=has art, 2=missing art
+        // Art filter: 0=all, 1=has art, 2=missing art, 3=favorites, 4=no favorites
         if (gFilterArt == 1 && !e.hasArt) continue;
         if (gFilterArt == 2 && e.hasArt) continue;
+        if (gFilterArt == 3 && !e.hasFavorite) continue;
+        if (gFilterArt == 4 && e.hasFavorite) continue;
         
         // Unresolved filter
         if (gFilterUnresolved && e.title.empty()) {
@@ -2921,6 +3047,13 @@ static void PopulateListFromItems(const std::vector<GameEntry>& items) {
     // Apply filters and save for double-click handling
     gFilteredItems = ApplyFilters(items);
 
+    // Sort by title (case-insensitive)
+    std::sort(gFilteredItems.begin(), gFilteredItems.end(), [](const GameEntry& a, const GameEntry& b) {
+        std::wstring ta = a.DisplayTitle().empty() ? a.idStr : a.DisplayTitle();
+        std::wstring tb = b.DisplayTitle().empty() ? b.idStr : b.DisplayTitle();
+        return _wcsicmp(ta.c_str(), tb.c_str()) < 0;
+    });
+
     for (size_t idx = 0; idx < gFilteredItems.size(); ++idx) {
         const auto& e = gFilteredItems[idx];
         int imgIndex = GetImageIndexForPathOrPlaceholder(e.hasArt ? e.filePath : L"");
@@ -2942,11 +3075,12 @@ static void PopulateListFromItems(const std::vector<GameEntry>& items) {
             ListView_SetItemText(gList, row, 2, (LPWSTR)e.idStr.c_str());
             ListView_SetItemText(gList, row, 3, (LPWSTR)(e.DisplayTitle().empty() ? L"(unresolved)" : e.DisplayTitle().c_str()));
             ListView_SetItemText(gList, row, 4, (LPWSTR)(e.hasArt ? L"No" : L"Yes"));
+            ListView_SetItemText(gList, row, 5, (LPWSTR)(e.hasFavorite ? L"\u2605" : L""));
 
             std::wstring fileCell = e.hasArt
                 ? e.fileName
                 : (!e.expectedFileName.empty() ? e.expectedFileName : L"(none)");
-            ListView_SetItemText(gList, row, 5, (LPWSTR)fileCell.c_str());
+            ListView_SetItemText(gList, row, 6, (LPWSTR)fileCell.c_str());
         }
     }
 
@@ -3010,6 +3144,107 @@ static bool QuickApplyArtToGame(GameEntry& entry, std::wstring& outStatus, std::
     debugInfo += L"Game: " + entry.title + L"\r\n";
     debugInfo += L"ID: " + entry.idStr + L"\r\n\r\n";
     
+    // --- Favorite art handling ---
+    if (gQuickApplyConfig.keepFavorites && entry.hasFavorite) {
+        debugInfo += L"[Favorite] Game has favorite art set.\r\n";
+        std::wstring fileName = entry.expectedFileName;
+        if (fileName.empty()) fileName = ExpectedPngFromManifestId(entry.store, entry.idStr);
+        
+        std::vector<unsigned char> favData;
+        bool favApplied = false;
+
+        // Strategy 1: If web-based favorite, try to re-download from URL first
+        if (!entry.favoriteWebUrl.empty()) {
+            debugInfo += L"[Favorite] Trying web URL: " + entry.favoriteWebUrl + L"\r\n";
+            if (HttpDownloadBinary(entry.favoriteWebUrl, favData) && !favData.empty()) {
+                debugInfo += L"[Favorite] Web download succeeded.\r\n";
+                favApplied = true;
+            } else {
+                debugInfo += L"[Favorite] Web download failed, trying local file fallback.\r\n";
+                favData.clear();
+            }
+        }
+
+        // Strategy 2: Try local favorite file
+        if (!favApplied) {
+            std::wstring favFilePath = GetFavoriteFilePath(entry.store, fileName);
+            if (fs::exists(favFilePath)) {
+                debugInfo += L"[Favorite] Using local file: " + favFilePath + L"\r\n";
+                // Read file into memory
+                HANDLE hFile = CreateFileW(favFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD fileSize = GetFileSize(hFile, nullptr);
+                    if (fileSize > 0 && fileSize != INVALID_FILE_SIZE) {
+                        favData.resize(fileSize);
+                        DWORD bytesRead = 0;
+                        if (ReadFile(hFile, favData.data(), fileSize, &bytesRead, nullptr) && bytesRead == fileSize) {
+                            favApplied = true;
+                        }
+                    }
+                    CloseHandle(hFile);
+                }
+                if (favApplied) {
+                    debugInfo += L"[Favorite] Local file read succeeded.\r\n";
+                } else {
+                    debugInfo += L"[Favorite] Local file read failed.\r\n";
+                    favData.clear();
+                }
+            } else {
+                debugInfo += L"[Favorite] Local favorite file not found.\r\n";
+            }
+        }
+
+        if (favApplied && !favData.empty()) {
+            // Apply the favorite image
+            fs::path savePath;
+            if (entry.hasArt && !entry.filePath.empty() && fs::exists(entry.filePath)) {
+                savePath = entry.filePath;
+            } else {
+                std::wstring basePath = GetThirdPartyLibrariesPath();
+                fs::path storePath = fs::path(basePath) / entry.store;
+                savePath = storePath / fileName;
+                if (!fs::exists(storePath)) fs::create_directories(storePath);
+            }
+
+            if (entry.hasArt && !entry.filePath.empty() && fs::exists(entry.filePath)) {
+                BackupOriginalArt(entry.store, entry.filePath, fileName);
+            }
+
+            std::wstring savePathStr = savePath.wstring();
+            if (fs::exists(savePath)) {
+                DWORD attrs = GetFileAttributesW(savePathStr.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+                    SetFileAttributesW(savePathStr.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                }
+            }
+
+            HANDLE hFile = CreateFileW(savePathStr.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                WriteFile(hFile, favData.data(), (DWORD)favData.size(), &written, nullptr);
+                CloseHandle(hFile);
+                SetFileReadOnly(savePathStr);
+                entry.hasArt = true;
+                entry.filePath = savePathStr;
+                entry.fileName = fileName;
+                outStatus = L"\u2605 Favorite applied";
+                debugInfo += L"\r\nResult: Favorite applied successfully!\r\n";
+                return true;
+            }
+            debugInfo += L"[Favorite] Failed to write file.\r\n";
+        }
+
+        // Favorite failed - decide strategy
+        if (!gQuickApplyConfig.favWithBackup) {
+            // "Without backup" mode: skip this game, don't override current art
+            outStatus = L"\u2605 Fav missing (skipped)";
+            debugInfo += L"[Favorite] Without-backup mode: skipping game.\r\n";
+            return false;
+        }
+        // "With backup" mode: fall through to normal Quick Apply behavior
+        debugInfo += L"[Favorite] With-backup mode: falling through to normal apply.\r\n";
+    }
+
     if (gConfig.steamGridDbKey.empty() && !gQuickApplyConfig.useWeb) {
         outStatus = L"No API key";
         debugInfo += L"ERROR: No API key and Web disabled\r\n";
@@ -3023,7 +3258,11 @@ static bool QuickApplyArtToGame(GameEntry& entry, std::wstring& outStatus, std::
     // Web search (if enabled)
     if (gQuickApplyConfig.useWeb && !entry.title.empty()) {
         debugInfo += L"Fetching Web results...\r\n";
-        debugInfo += L"Search query: " + entry.title + L" game cover imagesize:" + gQuickApplyConfig.webResolution + L"\r\n";
+        debugInfo += L"Search query: " + entry.title + L" game cover art";
+        if (gQuickApplyConfig.webResolution != L"Not specified") {
+            debugInfo += L" (size: " + gQuickApplyConfig.webResolution + L")";
+        }
+        debugInfo += L"\r\n";
         webSearchResults = WebSearchGameImages(entry.title, gQuickApplyConfig.webResolution, 0);
         debugInfo += L"Found " + std::to_wstring(webSearchResults.size()) + L" web images\r\n";
         for (size_t i = 0; i < webSearchResults.size() && i < 10; i++) {
@@ -3080,7 +3319,7 @@ static bool QuickApplyArtToGame(GameEntry& entry, std::wstring& outStatus, std::
         debugInfo += L"\r\n";
     }
     
-    // Filter out small/blurry images from SteamGridDB (web images are already sized correctly)
+    // Filter out small/blurry images
     std::vector<SteamGridDbImage> filteredImages;
     
     for (const auto& img : allImages) {
@@ -3092,6 +3331,7 @@ static bool QuickApplyArtToGame(GameEntry& entry, std::wstring& outStatus, std::
     // Determine which image to use
     const SteamGridDbImage* selectedImg = nullptr;
     int selectedIdx = 0;
+    std::vector<unsigned char> preDownloadedData;  // Data from successful download during fallback tries
     
     DebugLog(L"[QuickApply] useWeb=" + std::to_wstring(gQuickApplyConfig.useWeb) + 
              L" webRandom=" + std::to_wstring(gQuickApplyConfig.webRandom) + 
@@ -3107,17 +3347,67 @@ static bool QuickApplyArtToGame(GameEntry& entry, std::wstring& outStatus, std::
     debugInfo += L"Condition result=" + std::to_wstring(gQuickApplyConfig.useWeb && !gQuickApplyConfig.webRandom && !webSearchResults.empty()) + L"\r\n\r\n";
     
     if (gQuickApplyConfig.useWeb && !gQuickApplyConfig.webRandom && !webSearchResults.empty()) {
-        // Use specific web result index
-        int idx = gQuickApplyConfig.webResultIndex - 1;  // Convert to 0-based
-        if (idx < 0) idx = 0;
-        if (idx >= (int)webSearchResults.size()) idx = (int)webSearchResults.size() - 1;
-        selectedImg = &webSearchResults[idx];
-        selectedIdx = idx;
-        DebugLog(L"[QuickApply] Using web result #" + std::to_wstring(gQuickApplyConfig.webResultIndex) + 
-                 L" (index " + std::to_wstring(idx) + L") URL: " + selectedImg->url);
+        // Use specific web result index, falling back to next images if download fails
+        int startIdx = gQuickApplyConfig.webResultIndex - 1;  // Convert to 0-based
+        if (startIdx < 0) startIdx = 0;
+        if (startIdx >= (int)webSearchResults.size()) startIdx = (int)webSearchResults.size() - 1;
         
         debugInfo += L"Selection Mode: Specific web result #" + std::to_wstring(gQuickApplyConfig.webResultIndex) + L"\r\n";
-        debugInfo += L"Selected: " + selectedImg->url + L"\r\n";
+        
+        // Try from the selected index onward until one downloads successfully
+        for (int tryIdx = startIdx; tryIdx < (int)webSearchResults.size(); ++tryIdx) {
+            const SteamGridDbImage& tryImg = webSearchResults[tryIdx];
+            debugInfo += L"Trying index " + std::to_wstring(tryIdx + 1) + L": " + tryImg.url + L"\r\n";
+            
+            std::vector<unsigned char> tryData;
+            if (HttpDownloadBinary(tryImg.url, tryData) && !tryData.empty()) {
+                // Verify actual image dimensions are square when resolution is specified
+                bool requireSquare = (!gQuickApplyConfig.webResolution.empty() && gQuickApplyConfig.webResolution != L"Not specified");
+                if (requireSquare) {
+                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, tryData.size());
+                    if (hMem) {
+                        void* pMem = GlobalLock(hMem);
+                        if (pMem) {
+                            memcpy(pMem, tryData.data(), tryData.size());
+                            GlobalUnlock(hMem);
+                            IStream* pStream = nullptr;
+                            if (SUCCEEDED(CreateStreamOnHGlobal(hMem, FALSE, &pStream))) {
+                                Gdiplus::Image* chkImg = Gdiplus::Image::FromStream(pStream);
+                                pStream->Release();
+                                if (chkImg && chkImg->GetLastStatus() == Gdiplus::Ok) {
+                                    int cw = chkImg->GetWidth(), ch = chkImg->GetHeight();
+                                    delete chkImg;
+                                    if (cw != ch) {
+                                        GlobalFree(hMem);
+                                        debugInfo += L"Skipped index " + std::to_wstring(tryIdx + 1) + L" (not square: " + std::to_wstring(cw) + L"x" + std::to_wstring(ch) + L")\r\n";
+                                        continue;
+                                    }
+                                } else {
+                                    if (chkImg) delete chkImg;
+                                }
+                            }
+                        }
+                        GlobalFree(hMem);
+                    }
+                }
+                selectedImg = &webSearchResults[tryIdx];
+                selectedIdx = tryIdx;
+                preDownloadedData = std::move(tryData);
+                DebugLog(L"[QuickApply] Using web result #" + std::to_wstring(tryIdx + 1) + 
+                         L" (tried from #" + std::to_wstring(startIdx + 1) + L") URL: " + selectedImg->url);
+                debugInfo += L"Download OK at index " + std::to_wstring(tryIdx + 1) + L"\r\n";
+                break;
+            } else {
+                debugInfo += L"Download FAILED at index " + std::to_wstring(tryIdx + 1) + L", trying next...\r\n";
+                DebugLog(L"[QuickApply] Download failed for #" + std::to_wstring(tryIdx + 1) + L", trying next");
+            }
+        }
+        
+        if (!selectedImg) {
+            outStatus = L"All web downloads failed";
+            debugInfo += L"\r\nResult: All web result downloads failed\r\n";
+            return false;
+        }
     } else {
         // Random selection from all filtered images (including web)
         filteredImages.insert(filteredImages.end(), webSearchResults.begin(), webSearchResults.end());
@@ -3136,25 +3426,72 @@ static bool QuickApplyArtToGame(GameEntry& entry, std::wstring& outStatus, std::
                             (unsigned int)std::hash<std::wstring>{}(entry.idStr) ^
                             (counter * 2654435761u);  // Multiply by golden ratio prime for better distribution
         selectedIdx = seed % (int)filteredImages.size();
-        selectedImg = &filteredImages[selectedIdx];
         
         debugInfo += L"Selection Mode: Random (seed=" + std::to_wstring(seed) + 
                      L", total=" + std::to_wstring(filteredImages.size()) + 
                      L", selected index=" + std::to_wstring(selectedIdx) + L")\r\n";
-        debugInfo += L"Selected: " + selectedImg->url + L"\r\n";
-    }
-    
-    if (!selectedImg) {
-        outStatus = L"No art found";
-        debugInfo += L"\r\nResult: No art found\r\n";
-        return false;
+        
+        // Try the random pick first, then cycle through others on failure
+        for (int attempt = 0; attempt < (int)filteredImages.size(); ++attempt) {
+            int tryIdx = (selectedIdx + attempt) % (int)filteredImages.size();
+            const SteamGridDbImage& tryImg = filteredImages[tryIdx];
+            debugInfo += L"Trying index " + std::to_wstring(tryIdx) + L": " + tryImg.url + L"\r\n";
+            
+            std::vector<unsigned char> tryData;
+            if (HttpDownloadBinary(tryImg.url, tryData) && !tryData.empty()) {
+                // Verify actual image dimensions are square when resolution is specified
+                bool requireSquare = (!gQuickApplyConfig.webResolution.empty() && gQuickApplyConfig.webResolution != L"Not specified");
+                if (requireSquare) {
+                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, tryData.size());
+                    if (hMem) {
+                        void* pMem = GlobalLock(hMem);
+                        if (pMem) {
+                            memcpy(pMem, tryData.data(), tryData.size());
+                            GlobalUnlock(hMem);
+                            IStream* pStream = nullptr;
+                            if (SUCCEEDED(CreateStreamOnHGlobal(hMem, FALSE, &pStream))) {
+                                Gdiplus::Image* chkImg = Gdiplus::Image::FromStream(pStream);
+                                pStream->Release();
+                                if (chkImg && chkImg->GetLastStatus() == Gdiplus::Ok) {
+                                    int cw = chkImg->GetWidth(), ch = chkImg->GetHeight();
+                                    delete chkImg;
+                                    if (cw != ch) {
+                                        GlobalFree(hMem);
+                                        debugInfo += L"Skipped index " + std::to_wstring(tryIdx) + L" (not square: " + std::to_wstring(cw) + L"x" + std::to_wstring(ch) + L")\r\n";
+                                        continue;
+                                    }
+                                } else {
+                                    if (chkImg) delete chkImg;
+                                }
+                            }
+                        }
+                        GlobalFree(hMem);
+                    }
+                }
+                selectedImg = &filteredImages[tryIdx];
+                selectedIdx = tryIdx;
+                preDownloadedData = std::move(tryData);
+                debugInfo += L"Download OK at index " + std::to_wstring(tryIdx) + L"\r\n";
+                break;
+            } else {
+                debugInfo += L"Download FAILED at index " + std::to_wstring(tryIdx) + L", trying next...\r\n";
+            }
+        }
+        
+        if (!selectedImg) {
+            outStatus = L"All downloads failed";
+            debugInfo += L"\r\nResult: All image downloads failed\r\n";
+            return false;
+        }
     }
     
     const SteamGridDbImage& img = *selectedImg;
 
-    // Download the image - use direct download (not cached) to ensure fresh image
+    // Download the image (reuse pre-downloaded data if available from fallback tries)
     std::vector<unsigned char> data;
-    if (!HttpDownloadBinary(img.url, data) || data.empty()) {
+    if (!preDownloadedData.empty()) {
+        data = std::move(preDownloadedData);
+    } else if (!HttpDownloadBinary(img.url, data) || data.empty()) {
         outStatus = L"Download failed";
         debugInfo += L"\r\nResult: Download failed for " + img.url + L"\r\n";
         return false;
@@ -3251,7 +3588,7 @@ static void ShowQuickApplyDebugInfo(HWND hParent, const std::wstring& gameTitle,
                     WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
                     10, 10, 760, 530, hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
                 if (gDebugEdit) {
-                    SendMessage(gDebugEdit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+                    SendMessage(gDebugEdit, WM_SETFONT, (WPARAM)CreateDpiFont(hWnd), TRUE);
                     SendMessage(gDebugEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(5, 5));
                 }
                 
@@ -3260,7 +3597,7 @@ static void ShowQuickApplyDebugInfo(HWND hParent, const std::wstring& gameTitle,
                     WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
                     350, 550, 80, 28, hWnd, (HMENU)IDOK, GetModuleHandle(nullptr), nullptr);
                 if (btnOk) {
-                    SendMessage(btnOk, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+                    SendMessage(btnOk, WM_SETFONT, (WPARAM)CreateDpiFont(hWnd), TRUE);
                 }
                 
                 return 0;
@@ -3305,7 +3642,7 @@ static void ShowQuickApplyDebugInfo(HWND hParent, const std::wstring& gameTitle,
     
     HWND hDlg = CreateWindowExW(0, DEBUG_DLG_CLASS, title.c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 630,
+        CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(800, GetDpiForSystem(), 96), MulDiv(630, GetDpiForSystem(), 96),
         hParent, nullptr, GetModuleHandle(nullptr), (LPVOID)&debugText);
     
     if (hDlg) {
@@ -3353,6 +3690,9 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
     static HWND gQACfgLogosCheck = nullptr;
     static HWND gQACfgIconsCheck = nullptr;
     static HWND gQACfgApiWarning = nullptr;
+    static HWND gQACfgKeepFavCheck = nullptr;
+    static HWND gQACfgFavBackupRadio = nullptr;
+    static HWND gQACfgFavNoBackupRadio = nullptr;
     static bool dialogResult = false;
     
     if (!configDlgClassRegistered) {
@@ -3360,28 +3700,29 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
         wc.lpfnWndProc = [](HWND hWnd, UINT msg, WPARAM w, LPARAM l) -> LRESULT {
             switch (msg) {
             case WM_CREATE: {
+                auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
                 // Title
                 CreateWindowW(L"STATIC", L"Select art sources for Quick Apply:",
                     WS_CHILD | WS_VISIBLE,
-                    20, 20, 340, 20,
+                    d(20), d(20), d(340), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 // Web checkbox
                 gQACfgWebCheck = CreateWindowW(L"BUTTON", L"Web Search",
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    40, 50, 120, 20,
+                    d(40), d(50), d(120), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(gQACfgWebCheck, BM_SETCHECK, gQuickApplyConfig.useWeb ? BST_CHECKED : BST_UNCHECKED, 0);
                 
                 // Web resolution label and combo
                 CreateWindowW(L"STATIC", L"Size:",
                     WS_CHILD | WS_VISIBLE,
-                    180, 52, 35, 20,
+                    d(180), d(52), d(35), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 gQACfgWebResCombo = CreateWindowW(WC_COMBOBOXW, L"",
                     WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-                    220, 48, 100, 200,
+                    d(220), d(48), d(120), d(200),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 // Apply same styling as main window comboboxes
@@ -3397,42 +3738,44 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                     SetWindowLongPtrW(gQACfgWebResCombo, GWLP_WNDPROC, (LONG_PTR)ComboSubclassProc);
                 }
                 
+                SendMessageW(gQACfgWebResCombo, CB_ADDSTRING, 0, (LPARAM)L"Not specified");
                 SendMessageW(gQACfgWebResCombo, CB_ADDSTRING, 0, (LPARAM)L"265x265");
                 SendMessageW(gQACfgWebResCombo, CB_ADDSTRING, 0, (LPARAM)L"512x512");
                 SendMessageW(gQACfgWebResCombo, CB_ADDSTRING, 0, (LPARAM)L"1024x1024");
                 SendMessageW(gQACfgWebResCombo, CB_ADDSTRING, 0, (LPARAM)L"2160x2160");
                 SendMessageW(gQACfgWebResCombo, CB_ADDSTRING, 0, (LPARAM)L"4096x4096");
                 // Select current resolution
-                int selIdx = 2; // default 1024
-                if (gQuickApplyConfig.webResolution == L"265x265") selIdx = 0;
-                else if (gQuickApplyConfig.webResolution == L"512x512") selIdx = 1;
-                else if (gQuickApplyConfig.webResolution == L"2160x2160") selIdx = 3;
-                else if (gQuickApplyConfig.webResolution == L"4096x4096") selIdx = 4;
+                int selIdx = 3; // default 1024x1024
+                if (gQuickApplyConfig.webResolution == L"Not specified") selIdx = 0;
+                else if (gQuickApplyConfig.webResolution == L"265x265") selIdx = 1;
+                else if (gQuickApplyConfig.webResolution == L"512x512") selIdx = 2;
+                else if (gQuickApplyConfig.webResolution == L"2160x2160") selIdx = 4;
+                else if (gQuickApplyConfig.webResolution == L"4096x4096") selIdx = 5;
                 SendMessageW(gQACfgWebResCombo, CB_SETCURSEL, selIdx, 0);
                 
                 // Web result selection - Radio buttons (without text)
                 // "Choose the result #" option first
                 gQACfgWebIndexRadio = CreateWindowW(L"BUTTON", L"",
                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-                    60, 85, 16, 16,
+                    d(60), d(85), d(16), d(16),
                     hWnd, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
                 
                 // Separate label for "Choose the result # (Recommended)"
                 CreateWindowW(L"STATIC", L"Choose the result # (Recommended):",
                     WS_CHILD | WS_VISIBLE,
-                    80, 85, 260, 20,
+                    d(80), d(85), d(260), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 // Random option below
                 gQACfgWebRandomRadio = CreateWindowW(L"BUTTON", L"",
                     WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-                    60, 110, 16, 16,
+                    d(60), d(110), d(16), d(16),
                     hWnd, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
                 
                 // Separate label for Random
                 CreateWindowW(L"STATIC", L"Random",
                     WS_CHILD | WS_VISIBLE,
-                    80, 110, 60, 20,
+                    d(80), d(110), d(60), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 // Set the checked state AFTER creating both buttons
@@ -3444,7 +3787,7 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                 
                 gQACfgWebIndexEdit = CreateWindowW(L"EDIT", L"",
                     WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
-                    350, 83, 40, 20,
+                    d(350), d(83), d(40), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 wchar_t indexStr[10];
                 swprintf(indexStr, 10, L"%d", gQuickApplyConfig.webResultIndex);
@@ -3456,20 +3799,20 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                 // Web warning note
                 CreateWindowW(L"STATIC", L"Note: Web results are not curated and may be wrong",
                     WS_CHILD | WS_VISIBLE,
-                    40, 135, 380, 35,
+                    d(40), d(135), d(380), d(35),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 // API key warning (shown when no API key is set)
                 bool hasApiKey = !gConfig.steamGridDbKey.empty();
                 gQACfgApiWarning = CreateWindowW(L"STATIC", L"To use steamgrid go to 'Config' menu and put the API key there",
                     WS_CHILD | (hasApiKey ? 0 : WS_VISIBLE) | SS_LEFT,
-                    40, 170, 380, 35,
+                    d(40), d(170), d(380), d(35),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 
                 // Grids checkbox
                 gQACfgGridsCheck = CreateWindowW(L"BUTTON", L"Grids (SteamGridDB)",
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    40, 210, 180, 20,
+                    d(40), d(210), d(180), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(gQACfgGridsCheck, BM_SETCHECK, gQuickApplyConfig.useGrids ? BST_CHECKED : BST_UNCHECKED, 0);
                 EnableWindow(gQACfgGridsCheck, hasApiKey);
@@ -3477,7 +3820,7 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                 // Heroes checkbox
                 gQACfgHeroesCheck = CreateWindowW(L"BUTTON", L"Heroes (SteamGridDB)",
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    40, 240, 180, 20,
+                    d(40), d(240), d(180), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(gQACfgHeroesCheck, BM_SETCHECK, gQuickApplyConfig.useHeroes ? BST_CHECKED : BST_UNCHECKED, 0);
                 EnableWindow(gQACfgHeroesCheck, hasApiKey);
@@ -3485,7 +3828,7 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                 // Logos checkbox
                 gQACfgLogosCheck = CreateWindowW(L"BUTTON", L"Logos (SteamGridDB)",
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    40, 270, 180, 20,
+                    d(40), d(270), d(180), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(gQACfgLogosCheck, BM_SETCHECK, gQuickApplyConfig.useLogos ? BST_CHECKED : BST_UNCHECKED, 0);
                 EnableWindow(gQACfgLogosCheck, hasApiKey);
@@ -3493,20 +3836,50 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                 // Icons checkbox
                 gQACfgIconsCheck = CreateWindowW(L"BUTTON", L"Icons (SteamGridDB)",
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    40, 300, 180, 20,
+                    d(40), d(300), d(180), d(20),
                     hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(gQACfgIconsCheck, BM_SETCHECK, gQuickApplyConfig.useIcons ? BST_CHECKED : BST_UNCHECKED, 0);
                 EnableWindow(gQACfgIconsCheck, hasApiKey);
                 
+                // Separator line (just a static)
+                CreateWindowW(L"STATIC", L"",
+                    WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+                    d(20), d(328), d(380), d(2),
+                    hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+                // Keep Favorites checkbox
+                gQACfgKeepFavCheck = CreateWindowW(L"BUTTON", L"\u2605 Keep Favorites",
+                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                    d(40), d(338), d(160), d(20),
+                    hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(gQACfgKeepFavCheck, BM_SETCHECK, gQuickApplyConfig.keepFavorites ? BST_CHECKED : BST_UNCHECKED, 0);
+
+                // Favorite backup strategy radio buttons
+                gQACfgFavBackupRadio = CreateWindowW(L"BUTTON", L"With backup (fallback to normal)",
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
+                    d(60), d(362), d(280), d(20),
+                    hWnd, (HMENU)1003, GetModuleHandleW(nullptr), nullptr);
+
+                gQACfgFavNoBackupRadio = CreateWindowW(L"BUTTON", L"Without backup (skip if missing)",
+                    WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                    d(60), d(384), d(280), d(20),
+                    hWnd, (HMENU)1004, GetModuleHandleW(nullptr), nullptr);
+
+                if (gQuickApplyConfig.favWithBackup) {
+                    SendMessageW(gQACfgFavBackupRadio, BM_SETCHECK, BST_CHECKED, 0);
+                } else {
+                    SendMessageW(gQACfgFavNoBackupRadio, BM_SETCHECK, BST_CHECKED, 0);
+                }
+
                 // OK and Cancel buttons
                 CreateWindowW(L"BUTTON", L"OK",
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                    120, 340, 80, 30,
+                    d(120), d(415), d(80), d(30),
                     hWnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
                     
                 CreateWindowW(L"BUTTON", L"Cancel",
                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                    210, 340, 80, 30,
+                    d(210), d(415), d(80), d(30),
                     hWnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
                 
                 // Apply dark mode theming to checkboxes and radio buttons
@@ -3518,6 +3891,9 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                     SetWindowTheme(gQACfgHeroesCheck, L"DarkMode_Explorer", nullptr);
                     SetWindowTheme(gQACfgLogosCheck, L"DarkMode_Explorer", nullptr);
                     SetWindowTheme(gQACfgIconsCheck, L"DarkMode_Explorer", nullptr);
+                    SetWindowTheme(gQACfgKeepFavCheck, L"DarkMode_Explorer", nullptr);
+                    SetWindowTheme(gQACfgFavBackupRadio, L"DarkMode_Explorer", nullptr);
+                    SetWindowTheme(gQACfgFavNoBackupRadio, L"DarkMode_Explorer", nullptr);
                 }
                 
                 // Apply dark mode to window
@@ -3527,6 +3903,12 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                 } else {
                     BOOL dark = FALSE;
                     DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+                }
+                {
+                    HFONT hDpiFont = CreateDpiFont(hWnd);
+                    for (HWND c = GetWindow(hWnd, GW_CHILD); c != nullptr; c = GetWindow(c, GW_HWNDNEXT)) {
+                        SendMessageW(c, WM_SETFONT, (WPARAM)hDpiFont, TRUE);
+                    }
                 }
                 return 0;
             }
@@ -3647,8 +4029,8 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                     // Save configuration
                     gQuickApplyConfig.useWeb = (SendMessageW(gQACfgWebCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     int resIdx = (int)SendMessageW(gQACfgWebResCombo, CB_GETCURSEL, 0, 0);
-                    const wchar_t* resolutions[] = { L"265x265", L"512x512", L"1024x1024", L"2160x2160", L"4096x4096" };
-                    if (resIdx >= 0 && resIdx < 5) {
+                    const wchar_t* resolutions[] = { L"Not specified", L"265x265", L"512x512", L"1024x1024", L"2160x2160", L"4096x4096" };
+                    if (resIdx >= 0 && resIdx < 6) {
                         gQuickApplyConfig.webResolution = resolutions[resIdx];
                     }
                     
@@ -3675,6 +4057,8 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
                     gQuickApplyConfig.useHeroes = (SendMessageW(gQACfgHeroesCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     gQuickApplyConfig.useLogos = (SendMessageW(gQACfgLogosCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     gQuickApplyConfig.useIcons = (SendMessageW(gQACfgIconsCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    gQuickApplyConfig.keepFavorites = (SendMessageW(gQACfgKeepFavCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    gQuickApplyConfig.favWithBackup = (SendMessageW(gQACfgFavBackupRadio, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     
                     DebugLog(L"[ConfigDialog] FINAL CONFIG: webRandom=" + std::to_wstring(gQuickApplyConfig.webRandom) + 
                              L" webResultIndex=" + std::to_wstring(gQuickApplyConfig.webResultIndex));
@@ -3705,8 +4089,9 @@ static bool ShowQuickApplyConfigDialog(HWND hParent) {
         configDlgClassRegistered = true;
     }
     
-    int dlgWidth = 460;
-    int dlgHeight = 420;
+    UINT sysDpi4 = GetDpiForSystem();
+    int dlgWidth = MulDiv(460, sysDpi4, 96);
+    int dlgHeight = MulDiv(500, sysDpi4, 96);
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
     int x = workArea.left + ((workArea.right - workArea.left) - dlgWidth) / 2;
@@ -4007,7 +4392,7 @@ static void DoQuickApply(HWND hWnd) {
                     hWnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
                 
                 // Set font
-                HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                HFONT hFont = CreateDpiFont(hWnd);
                 SendMessageW(sEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
                 SendMessageW(sOkBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
                 
@@ -4074,8 +4459,8 @@ static void DoQuickApply(HWND hWnd) {
         resultWndClassRegistered = true;
     }
     
-    int dlgWidth = 500;
-    int dlgHeight = 400;
+    int dlgWidth = MulDiv(500, GetDpiForSystem(), 96);
+    int dlgHeight = MulDiv(400, GetDpiForSystem(), 96);
     RECT workArea;
     SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
     int x = workArea.left + ((workArea.right - workArea.left) - dlgWidth) / 2;
@@ -4324,6 +4709,13 @@ static bool HttpDownloadBinary(const std::wstring& url, std::vector<unsigned cha
         WINHTTP_NO_PROXY_BYPASS, 0);
 
     if (!hSession) return false;
+
+    // Set timeouts to avoid long hangs on unresponsive hosts (especially web search images)
+    DWORD resolveTimeout = 5000;   // 5s DNS resolve
+    DWORD connectTimeout = 8000;   // 8s connect
+    DWORD sendTimeout    = 8000;   // 8s send
+    DWORD receiveTimeout = 15000;  // 15s receive
+    WinHttpSetTimeouts(hSession, resolveTimeout, connectTimeout, sendTimeout, receiveTimeout);
 
     DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
     WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
@@ -4614,13 +5006,17 @@ static std::vector<SteamGridDbImage> SteamGridDbGetIcons(const std::wstring& gam
 // Forward declaration for debug logging
 static void DebugLog(const std::wstring& msg);
 
-// Web image search using Google Images
+// Web image search using DuckDuckGo Images API
 // Searches for game cover art with specified resolution
 static std::vector<SteamGridDbImage> WebSearchGameImages(const std::wstring& gameTitle, const std::wstring& resolution, int pageIndex = 0) {
     std::vector<SteamGridDbImage> results;
     
-    // Build search query: "GAME TITLE game cover imagesize:WIDTHxHEIGHT"
-    std::wstring searchQuery = gameTitle + L" game cover imagesize:" + resolution;
+    // Build search query for game cover art, include resolution if specified
+    std::wstring searchQuery = gameTitle + L" game cover art";
+    bool hasResolution = !resolution.empty() && resolution != L"Not specified";
+    if (hasResolution) {
+        searchQuery += L" " + resolution;
+    }
     
     DebugLog(L"[Web] Search query: " + searchQuery);
     DebugLog(L"[Web] Page: " + std::to_wstring(pageIndex));
@@ -4629,12 +5025,12 @@ static std::vector<SteamGridDbImage> WebSearchGameImages(const std::wstring& gam
     std::wstring encodedQuery;
     for (wchar_t c : searchQuery) {
         if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
-            (c >= L'0' && c <= L'9') || c == L'-' || c == L'_' || c == L'.' || c == L':') {
+            (c >= L'0' && c <= L'9') || c == L'-' || c == L'_' || c == L'.') {
             encodedQuery += c;
         } else if (c == L' ') {
             encodedQuery += L"+";
         } else {
-            // Percent encode
+            // Percent encode (handle multibyte properly)
             char narrowChar = (char)c;
             wchar_t buf[8];
             swprintf(buf, 8, L"%%%02X", (unsigned char)narrowChar);
@@ -4642,199 +5038,206 @@ static std::vector<SteamGridDbImage> WebSearchGameImages(const std::wstring& gam
         }
     }
     
-    // Use Google Images search
-    // tbm=isch for image search
-    // start= for pagination (Google uses ~20 results per page)
-    int startIndex = pageIndex * 20;
-    std::wstring url = L"https://www.google.com/search?q=" + encodedQuery + 
-                       L"&tbm=isch&start=" + std::to_wstring(startIndex);
-    
-    DebugLog(L"[Web] URL: " + url);
-    
-    // Use WinHTTP to get the page
-    HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) {
-        DebugLog(L"[Web] ERROR: Failed to open WinHTTP session");
-        return results;
-    }
-    
-    URL_COMPONENTSW urlComp{};
-    urlComp.dwStructSize = sizeof(urlComp);
-    wchar_t hostName[256]{};
-    wchar_t urlPath[2048]{};
-    urlComp.lpszHostName = hostName;
-    urlComp.dwHostNameLength = _countof(hostName);
-    urlComp.lpszUrlPath = urlPath;
-    urlComp.dwUrlPathLength = _countof(urlPath);
-    
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &urlComp)) {
-        DebugLog(L"[Web] ERROR: Failed to parse URL");
-        WinHttpCloseHandle(hSession);
-        return results;
-    }
-    
-    HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
-    if (!hConnect) {
-        DebugLog(L"[Web] ERROR: Failed to connect to server");
-        WinHttpCloseHandle(hSession);
-        return results;
-    }
-    
-    DWORD flags = WINHTTP_FLAG_SECURE;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath,
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hRequest) {
-        DebugLog(L"[Web] ERROR: Failed to open request");
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return results;
-    }
-    
-    // Set headers to look like a real browser
-    WinHttpAddRequestHeaders(hRequest, 
-        L"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8", 
-        -1, WINHTTP_ADDREQ_FLAG_ADD);
-    WinHttpAddRequestHeaders(hRequest, 
-        L"Accept-Language: en-US,en;q=0.5", 
-        -1, WINHTTP_ADDREQ_FLAG_ADD);
-    
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0)) {
-        DebugLog(L"[Web] ERROR: Failed to send request");
+    // Helper lambda to do an HTTP GET and return the body as std::string
+    auto httpGet = [](const std::wstring& fullUrl, const std::wstring& extraHeaders) -> std::string {
+        std::string body;
+        
+        HINTERNET hSession = WinHttpOpen(
+            L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) return body;
+        
+        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+        
+        URL_COMPONENTSW urlComp{};
+        urlComp.dwStructSize = sizeof(urlComp);
+        wchar_t hostName[256]{};
+        wchar_t urlPath[4096]{};
+        urlComp.lpszHostName = hostName;
+        urlComp.dwHostNameLength = _countof(hostName);
+        urlComp.lpszUrlPath = urlPath;
+        urlComp.dwUrlPathLength = _countof(urlPath);
+        
+        if (!WinHttpCrackUrl(fullUrl.c_str(), 0, 0, &urlComp)) {
+            WinHttpCloseHandle(hSession);
+            return body;
+        }
+        
+        HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+        if (!hConnect) { WinHttpCloseHandle(hSession); return body; }
+        
+        DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath,
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return body; }
+        
+        // Common headers
+        WinHttpAddRequestHeaders(hRequest, L"Accept: */*", -1, WINHTTP_ADDREQ_FLAG_ADD);
+        WinHttpAddRequestHeaders(hRequest, L"Accept-Language: en-US,en;q=0.9", -1, WINHTTP_ADDREQ_FLAG_ADD);
+        if (!extraHeaders.empty())
+            WinHttpAddRequestHeaders(hRequest, extraHeaders.c_str(), -1, WINHTTP_ADDREQ_FLAG_ADD);
+        
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hRequest, nullptr)) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            return body;
+        }
+        
+        DWORD bytesRead = 0;
+        char buffer[8192];
+        while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
+            body.append(buffer, bytesRead);
+        }
+        
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
+        return body;
+    };
+    
+    // --- DuckDuckGo Image Search ---
+    // Step 1: Get the vqd token from DuckDuckGo
+    std::wstring ddgUrl = L"https://duckduckgo.com/?q=" + encodedQuery + L"&iax=images&ia=images";
+    DebugLog(L"[Web] DDG token URL: " + ddgUrl);
+    
+    std::string tokenPage = httpGet(ddgUrl, L"");
+    DebugLog(L"[Web] DDG token page size: " + std::to_wstring(tokenPage.size()) + L" bytes");
+    
+    // Extract vqd token
+    std::string vqd;
+    {
+        // Look for vqd= in various formats
+        std::regex vqdRegex("vqd=([^&\"']+)");
+        std::smatch match;
+        if (std::regex_search(tokenPage, match, vqdRegex)) {
+            vqd = match[1].str();
+        }
+    }
+    if (vqd.empty()) {
+        // Try alternate pattern: "vqd":"..."
+        std::regex vqdRegex2("\"vqd\":\"([^\"]+)\"");
+        std::smatch match;
+        if (std::regex_search(tokenPage, match, vqdRegex2)) {
+            vqd = match[1].str();
+        }
+    }
+    
+    DebugLog(L"[Web] VQD token: " + Utf8ToWide(vqd));
+    
+    if (vqd.empty()) {
+        DebugLog(L"[Web] ERROR: Could not extract VQD token from DuckDuckGo");
         return results;
     }
     
-    if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        DebugLog(L"[Web] ERROR: Failed to receive response");
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+    // Step 2: Query the DuckDuckGo images API
+    std::wstring vqdW = Utf8ToWide(vqd);
+    int offset = pageIndex * 50;
+    // Use size filter based on resolution
+    std::wstring sizeFilter = L"size:Large";
+    if (hasResolution) {
+        // Parse requested minimum dimension
+        size_t xp = resolution.find(L'x');
+        if (xp != std::wstring::npos) {
+            int reqW = _wtoi(resolution.substr(0, xp).c_str());
+            if (reqW <= 512) sizeFilter = L"size:Medium";
+            else if (reqW >= 2160) sizeFilter = L"size:Wallpaper";
+            else sizeFilter = L"size:Large";
+        }
+    } else {
+        sizeFilter = L"";  // No size filter when not specified
+    }
+    std::wstring filterParam = sizeFilter.empty() ? L"" : (L"&f=" + sizeFilter);
+    std::wstring apiUrl = L"https://duckduckgo.com/i.js?l=us-en&o=json&q=" + encodedQuery +
+                          L"&vqd=" + vqdW +
+                          filterParam + L"&p=1" +
+                          L"&s=" + std::to_wstring(offset);
+    
+    DebugLog(L"[Web] DDG API URL: " + apiUrl);
+    
+    std::string jsonResp = httpGet(apiUrl, L"Referer: https://duckduckgo.com/");
+    DebugLog(L"[Web] DDG API response size: " + std::to_wstring(jsonResp.size()) + L" bytes");
+    
+    if (jsonResp.empty()) {
+        DebugLog(L"[Web] ERROR: Empty response from DuckDuckGo API");
         return results;
     }
     
-    // Read response
-    std::string htmlContent;
-    DWORD bytesRead = 0;
-    char buffer[8192];
-    while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
-        htmlContent.append(buffer, bytesRead);
-    }
-    
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    
-    DebugLog(L"[Web] Response size: " + std::to_wstring(htmlContent.size()) + L" bytes");
-    
-    // Google embeds image data in the page in various formats
-    // Look for image URLs in data attributes or JSON-like structures
+    // Step 3: Parse the JSON response
+    // DuckDuckGo returns: {"results":[{"image":"URL","width":N,"height":N,"thumbnail":"URL",...},...]}
+    // We do simple string parsing since we don't have a JSON library
     std::vector<std::string> imageUrls;
-    
-    // Pattern 1: Look for ["URL",width,height] patterns (Google's image data format)
+    std::vector<std::pair<int,int>> imageDims;  // width, height pairs
     {
-        std::regex imgRegex("\\[\"(https?://[^\"]+\\.(?:jpg|jpeg|png|webp)[^\"]*)\",[0-9]+,[0-9]+\\]");
-        auto begin = std::sregex_iterator(htmlContent.begin(), htmlContent.end(), imgRegex);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            std::string url = (*it)[1].str();
-            // Skip Google's own thumbnails
-            if (url.find("gstatic.com") == std::string::npos && 
-                url.find("google.com") == std::string::npos) {
-                imageUrls.push_back(url);
-            }
-        }
-        DebugLog(L"[Web] Pattern 1 found: " + std::to_wstring(imageUrls.size()));
-    }
-    
-    // Pattern 2: Look for ou":"URL" (original URL in JSON)
-    {
-        std::regex imgRegex("\"ou\":\"(https?://[^\"]+)\"");
-        auto begin = std::sregex_iterator(htmlContent.begin(), htmlContent.end(), imgRegex);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            std::string url = (*it)[1].str();
-            if (url.find("gstatic.com") == std::string::npos && 
-                url.find("google.com") == std::string::npos) {
-                // Check if not already added
-                bool found = false;
-                for (const auto& existing : imageUrls) {
-                    if (existing == url) { found = true; break; }
-                }
-                if (!found) imageUrls.push_back(url);
-            }
-        }
-        DebugLog(L"[Web] After pattern 2: " + std::to_wstring(imageUrls.size()));
-    }
-    
-    // Pattern 3: Look for data-src with image URLs
-    {
-        std::regex imgRegex("data-src=\"(https?://[^\"]+\\.(?:jpg|jpeg|png|webp)[^\"]*)\"");
-        auto begin = std::sregex_iterator(htmlContent.begin(), htmlContent.end(), imgRegex);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            std::string url = (*it)[1].str();
-            if (url.find("gstatic.com") == std::string::npos && 
-                url.find("google.com") == std::string::npos) {
-                bool found = false;
-                for (const auto& existing : imageUrls) {
-                    if (existing == url) { found = true; break; }
-                }
-                if (!found) imageUrls.push_back(url);
-            }
-        }
-        DebugLog(L"[Web] After pattern 3: " + std::to_wstring(imageUrls.size()));
-    }
-    
-    int count = 0;
-    for (const auto& imgUrl : imageUrls) {
-        
-        // Decode any escaped characters
-        std::string decodedUrl;
-        for (size_t i = 0; i < imgUrl.size(); ++i) {
-            if (imgUrl[i] == '\\' && i + 1 < imgUrl.size() && imgUrl[i+1] == '/') {
-                decodedUrl += '/';
-                ++i;
-            } else if (imgUrl[i] == '\\' && i + 1 < imgUrl.size() && imgUrl[i+1] == 'u') {
-                // Unicode escape \uXXXX - try to decode
-                if (i + 5 < imgUrl.size()) {
-                    try {
-                        std::string hex = imgUrl.substr(i + 2, 4);
-                        int codepoint = std::stoi(hex, nullptr, 16);
-                        if (codepoint < 128) {
-                            decodedUrl += (char)codepoint;
-                        }
-                        i += 5;
-                    } catch (...) {
-                        decodedUrl += imgUrl[i];
-                    }
+        // Find each "image":"..." entry
+        std::string searchStr = "\"image\":\"";
+        size_t pos = 0;
+        while ((pos = jsonResp.find(searchStr, pos)) != std::string::npos) {
+            pos += searchStr.size();
+            size_t endPos = jsonResp.find("\"", pos);
+            if (endPos == std::string::npos) break;
+            
+            std::string url = jsonResp.substr(pos, endPos - pos);
+            
+            // Decode escaped forward slashes
+            std::string decoded;
+            for (size_t i = 0; i < url.size(); ++i) {
+                if (url[i] == '\\' && i + 1 < url.size() && url[i+1] == '/') {
+                    decoded += '/';
+                    ++i;
                 } else {
-                    decodedUrl += imgUrl[i];
+                    decoded += url[i];
                 }
-            } else {
-                decodedUrl += imgUrl[i];
             }
+            
+            if (decoded.find("http") == 0) {
+                imageUrls.push_back(decoded);
+                
+                // Try to find width/height near this result
+                int w = 0, h = 0;
+                // Look for "width":N and "height":N within next ~200 chars
+                size_t searchEnd = std::min(endPos + 200, jsonResp.size());
+                std::string nearby = jsonResp.substr(endPos, searchEnd - endPos);
+                
+                std::regex wRegex("\"width\":(\\d+)");
+                std::regex hRegex("\"height\":(\\d+)");
+                std::smatch wm, hm;
+                if (std::regex_search(nearby, wm, wRegex)) w = std::stoi(wm[1].str());
+                if (std::regex_search(nearby, hm, hRegex)) h = std::stoi(hm[1].str());
+                imageDims.push_back({w, h});
+            }
+            
+            pos = endPos;
+        }
+    }
+    
+    DebugLog(L"[Web] DDG found " + std::to_wstring(imageUrls.size()) + L" image URLs");
+    
+    // Step 4: Build result list, filtering out non-square images when resolution specified
+    int count = 0;
+    for (size_t i = 0; i < imageUrls.size(); ++i) {
+        int imgW = 0, imgH = 0;
+        if (i < imageDims.size()) {
+            imgW = imageDims[i].first;
+            imgH = imageDims[i].second;
         }
         
-        // Skip if URL looks invalid
-        if (decodedUrl.find("http") != 0) continue;
+        // Filter: when a resolution is specified, only accept square images
+        if (hasResolution && imgW > 0 && imgH > 0) {
+            if (imgW != imgH) {
+                continue;  // Skip non-square images
+            }
+        }
         
         SteamGridDbImage img;
-        img.id = std::to_wstring(startIndex + count);
-        img.url = Utf8ToWide(decodedUrl);
-        img.thumb = img.url;  // Use same URL for thumbnail
-        img.author = L"Google Images";
-        
-        // Parse resolution from the search query
-        size_t xPos = resolution.find(L'x');
-        if (xPos != std::wstring::npos) {
-            img.width = _wtoi(resolution.substr(0, xPos).c_str());
-            img.height = _wtoi(resolution.substr(xPos + 1).c_str());
-        }
+        img.id = std::to_wstring(offset + count);
+        img.url = Utf8ToWide(imageUrls[i]);
+        img.thumb = img.url;
+        img.author = L"Web Search";
+        img.width = imgW;
+        img.height = imgH;
         
         results.push_back(img);
         ++count;
@@ -4859,7 +5262,9 @@ static void DestroyArtImageList() {
 static void CloseArtWindow(bool applyChanges);
 static void OpenConfigWindow(HWND parent);
 
-static HBITMAP CreateThumbnailFromUrl(const std::wstring& url, int size, const std::wstring& gameId = L"") {
+static HBITMAP CreateThumbnailFromUrl(const std::wstring& url, int size, const std::wstring& gameId = L"", int* outOrigW = nullptr, int* outOrigH = nullptr) {
+    if (outOrigW) *outOrigW = 0;
+    if (outOrigH) *outOrigH = 0;
     std::vector<unsigned char> data;
     if (!HttpDownloadBinaryCached(url, data, gameId) || data.empty()) {
         return nullptr;
@@ -4889,6 +5294,8 @@ static HBITMAP CreateThumbnailFromUrl(const std::wstring& url, int size, const s
                 // Scale to fit
                 int srcW = srcImg->GetWidth();
                 int srcH = srcImg->GetHeight();
+                if (outOrigW) *outOrigW = srcW;
+                if (outOrigH) *outOrigH = srcH;
                 float scale = (float)size / std::max(srcW, srcH);
                 int dstW = (int)(srcW * scale);
                 int dstH = (int)(srcH * scale);
@@ -4926,23 +5333,15 @@ static void DebugLog(const std::wstring& msg) {
 static void PopulateArtList() {
     if (!gArtList) return;
 
-    // Cancel any previous loading
-    gArtCancelLoading = true;
-    
-    // Increment generation to invalidate any in-progress loads
+    // Cancel any previous thumbnail loading
+    if (gThumbState) {
+        gThumbState->cancelFlag.store(true);
+        gThumbState.reset();
+    }
+    KillTimer(gArtWnd, THUMB_TIMER_ID);
+
     ++gArtLoadGeneration;
     int myGeneration = gArtLoadGeneration;
-    
-    // Wait a moment for previous loading to notice cancellation
-    MSG msg;
-    for (int i = 0; i < 10 && gArtIsLoading; ++i) {
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        Sleep(10);
-    }
-
     gArtCancelLoading = false;
     gArtIsLoading = true;
 
@@ -4998,184 +5397,239 @@ static void PopulateArtList() {
     // Re-enable redraw
     SendMessageW(gArtList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(gArtList, nullptr, TRUE);
-
-    // Update UI before loading
     UpdateWindow(gArtWnd);
+
+    if (gArtImages.empty()) {
+        gArtIsLoading = false;
+        return;
+    }
 
     DebugLog(L"Starting to load " + std::to_wstring(gArtImages.size()) + L" images with parallel downloads...");
 
-    // Copy images to download - gArtImages may change if user switches tabs
-    struct DownloadTask {
-        size_t index;
-        std::wstring url;
-    };
-    std::vector<DownloadTask> tasks;
+    // Create shared state on heap — worker threads hold shared_ptr so state outlives this function
+    auto state = std::make_shared<ThumbLoadState>();
+    state->thumbSize = thumbSize;
+    state->gameIdForCache = gArtGameId;
+    state->requireSquare = (gArtCurrentTab == ART_WEB && !gArtWebResolution.empty() && gArtWebResolution != L"Not specified");
+    state->generation = myGeneration;
+
     for (size_t i = 0; i < gArtImages.size(); ++i) {
         std::wstring thumbUrl = gArtImages[i].thumb.empty() ? gArtImages[i].url : gArtImages[i].thumb;
-        tasks.push_back({ i, thumbUrl });
+        state->tasks.push_back({ i, thumbUrl, gArtImages[i].width, gArtImages[i].height });
     }
-    
-    size_t imageCount = tasks.size();
-    
-    // Determine parallel download count from config (0 = auto = CPU threads)
+    state->imageCount = state->tasks.size();
+
+    // Determine parallel download count
     int parallelCount = gConfig.parallelDownloads;
     if (parallelCount <= 0) {
         parallelCount = (int)std::thread::hardware_concurrency();
-        if (parallelCount < 2) parallelCount = 8; // Fallback
+        if (parallelCount < 2) parallelCount = 8;
     }
-    
-    // Results structure
-    struct DownloadResult {
-        size_t index;
-        HBITMAP hBitmap;
-    };
-    std::mutex resultsMutex;
-    std::vector<DownloadResult> completedResults;
-    std::atomic<size_t> nextTask(0);
-    std::atomic<size_t> completedCount(0);
-    std::atomic<bool> cancelFlag(false);
-    
-    // Worker function - capture gameId for cache tracking
-    std::wstring gameIdForCache = gArtGameId;
-    auto workerFunc = [&, gameIdForCache]() {
-        while (!cancelFlag.load()) {
-            size_t taskIdx = nextTask.fetch_add(1);
-            if (taskIdx >= tasks.size()) break;
-            
-            const auto& task = tasks[taskIdx];
-            HBITMAP hThumb = CreateThumbnailFromUrl(task.url, thumbSize, gameIdForCache);
-            
-            if (cancelFlag.load()) {
+
+    // Worker function — captures shared_ptr by value
+    auto workerFunc = [state]() {
+        while (!state->cancelFlag.load()) {
+            size_t taskIdx = state->nextTask.fetch_add(1);
+            if (taskIdx >= state->tasks.size()) break;
+
+            const auto& task = state->tasks[taskIdx];
+
+            // Skip images already known to be non-square
+            if (state->requireSquare && task.reportedW > 0 && task.reportedH > 0 && task.reportedW != task.reportedH) {
+                {
+                    std::lock_guard<std::mutex> lock(state->resultsMutex);
+                    state->completedResults.push_back({ task.index, nullptr, task.reportedW, task.reportedH });
+                }
+                state->completedCount.fetch_add(1);
+                continue;
+            }
+
+            int origW = 0, origH = 0;
+            HBITMAP hThumb = CreateThumbnailFromUrl(task.url, state->thumbSize, state->gameIdForCache, &origW, &origH);
+
+            if (state->cancelFlag.load()) {
                 if (hThumb) DeleteObject(hThumb);
                 break;
             }
-            
-            {
-                std::lock_guard<std::mutex> lock(resultsMutex);
-                completedResults.push_back({ task.index, hThumb });
+
+            if (hThumb && state->requireSquare && origW > 0 && origH > 0 && origW != origH) {
+                DeleteObject(hThumb);
+                hThumb = nullptr;
             }
-            completedCount.fetch_add(1);
+
+            {
+                std::lock_guard<std::mutex> lock(state->resultsMutex);
+                state->completedResults.push_back({ task.index, hThumb, origW, origH });
+            }
+            state->completedCount.fetch_add(1);
+        }
+
+        // On cancel, clean up unconsumed bitmaps
+        if (state->cancelFlag.load()) {
+            std::lock_guard<std::mutex> lock(state->resultsMutex);
+            for (auto& r : state->completedResults) {
+                if (r.hBitmap) { DeleteObject(r.hBitmap); r.hBitmap = nullptr; }
+            }
         }
     };
-    
-    // Start worker threads
-    std::vector<std::thread> workers;
-    int numThreads = (imageCount < (size_t)parallelCount) ? (int)imageCount : parallelCount;
+
+    // Launch detached workers — no join needed, cancel flag stops them
+    int numThreads = ((int)state->imageCount < parallelCount) ? (int)state->imageCount : parallelCount;
     for (int t = 0; t < numThreads; ++t) {
-        workers.emplace_back(workerFunc);
+        std::thread(workerFunc).detach();
     }
-    
-    // Process results on main thread while workers are downloading
-    size_t processedCount = 0;
-    while (processedCount < imageCount) {
-        // Check for cancellation
-        if (gArtCancelLoading || !gArtWnd || myGeneration != gArtLoadGeneration) {
-            DebugLog(L"Loading cancelled.");
-            cancelFlag.store(true);
-            break;
+
+    // Store state globally and start a timer to poll results
+    gThumbState = state;
+    SetTimer(gArtWnd, THUMB_TIMER_ID, 30, nullptr);  // Poll every 30ms
+    // Returns immediately — UI thread is free
+}
+
+// Compare function for ListView_SortItems: loaded thumbnails first, then by original index
+static int CALLBACK ThumbSortCompare(LPARAM lp1, LPARAM lp2, LPARAM lpSort) {
+    auto* loaded = reinterpret_cast<std::set<size_t>*>(lpSort);
+    bool l1 = loaded->count((size_t)lp1) > 0;
+    bool l2 = loaded->count((size_t)lp2) > 0;
+    if (l1 != l2) return l1 ? -1 : 1;
+    return (lp1 < lp2) ? -1 : (lp1 > lp2) ? 1 : 0;
+}
+
+// Helper to find a ListView item's visual position by its lParam value
+static int FindListViewItemByParam(HWND hList, LPARAM param) {
+    LVFINDINFOW fi{};
+    fi.flags = LVFI_PARAM;
+    fi.lParam = param;
+    return ListView_FindItem(hList, -1, &fi);
+}
+
+// Called by WM_TIMER (THUMB_TIMER_ID) to process thumbnail download results without blocking
+static void ProcessThumbnailPoll() {
+    auto state = gThumbState;
+    if (!state || !gArtList || !gArtWnd || !gArtImgList) {
+        // Nothing to do or window gone
+        KillTimer(gArtWnd, THUMB_TIMER_ID);
+        if (state) { state->cancelFlag.store(true); gThumbState.reset(); }
+        gArtIsLoading = false;
+        return;
+    }
+
+    // Check if this load is still current
+    if (state->generation != gArtLoadGeneration || gArtCancelLoading) {
+        state->cancelFlag.store(true);
+        KillTimer(gArtWnd, THUMB_TIMER_ID);
+        gThumbState.reset();
+        gArtIsLoading = false;
+        return;
+    }
+
+    // Drain completed results
+    std::vector<ThumbLoadState::Result> toProcess;
+    {
+        std::lock_guard<std::mutex> lock(state->resultsMutex);
+        toProcess.swap(state->completedResults);
+    }
+
+    for (const auto& result : toProcess) {
+        if (!gArtWnd || !gArtList || !gArtImgList || state->generation != gArtLoadGeneration) {
+            if (result.hBitmap) DeleteObject(result.hBitmap);
+            continue;
         }
-        
-        // Process pending Windows messages
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-            if (gArtCancelLoading || !gArtWnd || myGeneration != gArtLoadGeneration) {
-                cancelFlag.store(true);
-                break;
-            }
-        }
-        
-        if (cancelFlag.load()) break;
-        
-        // Process any completed results
-        std::vector<DownloadResult> toProcess;
-        {
-            std::lock_guard<std::mutex> lock(resultsMutex);
-            toProcess.swap(completedResults);
-        }
-        
-        for (const auto& result : toProcess) {
-            if (!gArtWnd || !gArtList || !gArtImgList || myGeneration != gArtLoadGeneration) {
-                if (result.hBitmap) DeleteObject(result.hBitmap);
-                continue;
-            }
-            
-            if (result.hBitmap) {
-                int imgIdx = ImageList_Add(gArtImgList, result.hBitmap, nullptr);
-                DeleteObject(result.hBitmap);
-                
+
+        if (result.hBitmap) {
+            int imgIdx = ImageList_Add(gArtImgList, result.hBitmap, nullptr);
+            DeleteObject(result.hBitmap);
+
+            // Find item by lParam (original index) since sorting may have moved it
+            int pos = FindListViewItemByParam(gArtList, (LPARAM)result.index);
+            if (pos >= 0) {
                 LVITEM it{};
                 it.mask = LVIF_IMAGE;
-                it.iItem = (int)result.index;
+                it.iItem = pos;
                 it.iImage = imgIdx;
                 ListView_SetItem(gArtList, &it);
-                
-                DebugLog(L"[" + std::to_wstring(result.index + 1) + L"] OK - loaded successfully");
-            } else {
-                DebugLog(L"[" + std::to_wstring(result.index + 1) + L"] FAILED - could not load thumbnail");
             }
-            processedCount++;
+
+            state->loadedIndices.insert(result.index);
+            DebugLog(L"[" + std::to_wstring(result.index + 1) + L"] OK - loaded successfully");
+        } else {
+            state->failedIndices.push_back(result.index);
+            DebugLog(L"[" + std::to_wstring(result.index + 1) + L"] FAILED - will be removed");
         }
-        
-        // Update status
-        size_t currentCompleted = completedCount.load();
-        if (currentCompleted > 0) {
-            std::wstring statusMsg = L"Loading thumbnails: " + std::to_wstring(currentCompleted) + L" of " + std::to_wstring(imageCount) + L"...";
-            SetWindowTextW(gArtStatus, statusMsg.c_str());
-        }
-        
-        // Redraw periodically
-        if (processedCount % 4 == 0 || processedCount == imageCount) {
-            ListView_RedrawItems(gArtList, 0, (int)imageCount - 1);
-            UpdateWindow(gArtList);
-        }
-        
-        // Small sleep to avoid busy-waiting
-        Sleep(10);
-    }
-    
-    // Wait for all worker threads to finish
-    for (auto& worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-    
-    // Clean up any remaining results if cancelled
-    {
-        std::lock_guard<std::mutex> lock(resultsMutex);
-        for (const auto& result : completedResults) {
-            if (result.hBitmap) DeleteObject(result.hBitmap);
-        }
-        completedResults.clear();
+        state->processedCount++;
     }
 
-    gArtIsLoading = false;
+    // Sort loaded thumbnails to the front
+    if (!toProcess.empty() && !state->loadedIndices.empty()) {
+        ListView_SortItems(gArtList, ThumbSortCompare, (LPARAM)&state->loadedIndices);
+    }
 
-    // Only update final status if this is still the current generation
-    if (myGeneration == gArtLoadGeneration && gArtStatus && !cancelFlag.load()) {
-        std::wstring finalStatus = L"Found " + std::to_wstring(imageCount) + L" images. Select one and click Apply.";
+    // Update status
+    size_t currentCompleted = state->completedCount.load();
+    if (currentCompleted > 0 && state->processedCount < state->imageCount) {
+        std::wstring statusMsg = L"Loading thumbnails: " + std::to_wstring(currentCompleted) + L" of " + std::to_wstring(state->imageCount) + L"...";
+        SetWindowTextW(gArtStatus, statusMsg.c_str());
+    }
+
+    // Periodic redraw
+    if (!toProcess.empty()) {
+        ListView_RedrawItems(gArtList, 0, (int)state->imageCount - 1);
+        UpdateWindow(gArtList);
+    }
+
+    // Check if all done
+    if (state->processedCount >= state->imageCount) {
+        KillTimer(gArtWnd, THUMB_TIMER_ID);
+        gArtIsLoading = false;
+
+        // Remove failed items by lParam (original index) since items may be sorted
+        if (!state->failedIndices.empty()) {
+            // Sort descending so gArtImages erasure doesn't shift later indices
+            std::sort(state->failedIndices.begin(), state->failedIndices.end(), std::greater<size_t>());
+            for (size_t idx : state->failedIndices) {
+                int pos = FindListViewItemByParam(gArtList, (LPARAM)idx);
+                if (pos >= 0) {
+                    ListView_DeleteItem(gArtList, pos);
+                }
+                if (idx < gArtImages.size()) {
+                    gArtImages.erase(gArtImages.begin() + idx);
+                }
+            }
+            DebugLog(L"Removed " + std::to_wstring(state->failedIndices.size()) + L" failed images. " + std::to_wstring(gArtImages.size()) + L" remaining.");
+        }
+
+        std::wstring finalStatus = L"Found " + std::to_wstring(gArtImages.size()) + L" images. Select one and click Apply.";
         SetWindowTextW(gArtStatus, finalStatus.c_str());
         DebugLog(L"Thumbnail loading complete.");
-        
-        // Final redraw
-        if (gArtList) {
-            ListView_RedrawItems(gArtList, 0, (int)imageCount - 1);
-            UpdateWindow(gArtList);
-        }
+
+        ListView_RedrawItems(gArtList, 0, (int)gArtImages.size() - 1);
+        UpdateWindow(gArtList);
+
+        gThumbState.reset();
     }
 }
+
 
 static void ApplySelectedArt() {
     if (!gArtList) return;
 
     int sel = ListView_GetNextItem(gArtList, -1, LVNI_SELECTED);
-    if (sel < 0 || sel >= (int)gArtImages.size()) {
+    if (sel < 0) {
         DarkMessageBox(gArtWnd, L"Please select an image first.", L"No Selection", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    const SteamGridDbImage& img = gArtImages[sel];
+    // Use lParam to get original gArtImages index (items may be sorted)
+    LVITEM lvi{};
+    lvi.mask = LVIF_PARAM;
+    lvi.iItem = sel;
+    ListView_GetItem(gArtList, &lvi);
+    int imgIndex = (int)lvi.lParam;
+    if (imgIndex < 0 || imgIndex >= (int)gArtImages.size()) {
+        DarkMessageBox(gArtWnd, L"Please select an image first.", L"No Selection", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    const SteamGridDbImage& img = gArtImages[imgIndex];
 
     // Download full image
     // Pass gameId for cache tracking - will re-download if cache was cleared
@@ -5252,6 +5706,9 @@ static void ApplySelectedArt() {
     }
     // Save cache and refresh
     SaveUiStateToCacheFile();
+
+    // Track the web URL so "★ Favorite" can reuse it later
+    gArtLastAppliedWebUrl = img.url;
 
     SetWindowTextW(gArtStatus, L"Art saved successfully!");
     DarkMessageBox(gArtWnd, L"Art has been saved successfully!\n\nThe file has been set to read-only to prevent the Xbox app from modifying it.", L"Success", MB_OK | MB_ICONINFORMATION);
@@ -5530,17 +5987,21 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
     switch (msg) {
     case WM_CREATE: {
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        HFONT hFontBold = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT hFont = CreateDpiFont(hWnd);
+        HFONT hFontBold = CreateDpiFont(hWnd, 14, FW_BOLD);
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
+
+        // Get initial window size for proportional layout
+        RECT initRc;
+        GetClientRect(hWnd, &initRc);
+        int initW = initRc.right - initRc.left;
 
         // --- Top section: Current art preview + game info ---
 
         // Current art label
         CreateWindowW(L"STATIC", L"Current Art:",
             WS_CHILD | WS_VISIBLE,
-            12, 10, 100, 18,
+            d(12), d(10), d(100), d(18),
             hWnd, nullptr,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5548,9 +6009,15 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // --- Top right: Game Title Search and Save ---
         static const int IDC_ART_TITLE_EDIT = 4100;
         static const int IDC_ART_TITLE_SAVE_BTN = 4101;
+        int titleBtnW = d(140);  // Wide enough for "Save and Search"
+        int titleEditW = d(200);
+        int titleSpacing = d(8);
+        int titleRightEdge = initW - d(12);
+        int titleBtnLeft = titleRightEdge - titleBtnW;
+        int titleEditLeft = titleBtnLeft - titleSpacing - titleEditW;
         HWND gArtTitleEdit = CreateWindowW(L"EDIT", (!gArtCurrentEntry.customTitle.empty() ? gArtCurrentEntry.customTitle.c_str() : (gArtCurrentEntry.title.empty() ? L"" : gArtCurrentEntry.title.c_str())),
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            650, 10, 200, 24,
+            titleEditLeft, d(10), titleEditW, d(24),
             hWnd, (HMENU)(INT_PTR)IDC_ART_TITLE_EDIT,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gArtTitleEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -5558,7 +6025,7 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         HWND gArtTitleSaveBtn = CreateWindowW(L"BUTTON", L"Save and Search",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            860, 10, 120, 24,
+            titleBtnLeft, d(10), titleBtnW, d(24),
             hWnd, (HMENU)(INT_PTR)IDC_ART_TITLE_SAVE_BTN,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gArtTitleSaveBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -5566,15 +6033,15 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // Browse Local Image button (placed just under Save and Search)
         gArtBrowseLocalBtn = CreateWindowW(L"BUTTON", L"Browse Local Image",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            860, 35, 120, 24, // x, y, width, height (x matches Save and Search, y is just below)
-            hWnd, (HMENU)12345, // Unique ID for the browse button
+            titleBtnLeft, d(38), titleBtnW, d(24),
+            hWnd, (HMENU)12345,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gArtBrowseLocalBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
         // Current art preview (we'll draw it ourselves)
         gArtCurrentImg = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | WS_BORDER,
-            12, 30, 120, 160,
+            d(12), d(30), d(120), d(160),
             hWnd, (HMENU)(INT_PTR)IDC_ART_CURRENT_IMG,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5600,43 +6067,50 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         gArtInfoLabel = CreateWindowW(L"EDIT", infoText.c_str(),
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            145, 30, 350, 120,
+            d(145), d(30), initW - d(145) - titleBtnW - titleSpacing - d(12), d(120),
             hWnd, (HMENU)(INT_PTR)IDC_ART_INFO_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         // Restore button (only enabled if backup exists)
         HWND restoreBtn = CreateWindowW(L"BUTTON", L"Restore Original",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | (hasBackup ? 0 : WS_DISABLED),
-            145, 155, 120, 28,
+            d(145), d(155), d(130), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_ART_RESTORE_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         // Clear cache button for this game
         CreateWindowW(L"BUTTON", L"Clear Cache",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            275, 155, 100, 28,
+            d(282), d(155), d(110), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_ART_CLEAR_CACHE_BTN,
+            GetModuleHandleW(nullptr), nullptr);
+
+        // Set current art as favorite button (next to Restore/Clear Cache)
+        CreateWindowW(L"BUTTON", L"\u2605 Favorite",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            d(400), d(155), d(110), d(28),
+            hWnd, (HMENU)(INT_PTR)IDC_ART_SET_FAV_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         // --- Middle section: Status ---
 
         gArtStatus = CreateWindowW(L"STATIC", L"Loading images from SteamGridDB...",
             WS_CHILD | WS_VISIBLE,
-            12, 205, 500, 20,
+            d(12), d(205), d(500), d(20),
             hWnd, (HMENU)(INT_PTR)IDC_ART_STATUS,
             GetModuleHandleW(nullptr), nullptr);
         
         // Red warning for missing API key (hidden initially)
         gArtApiWarning = CreateWindowW(L"STATIC", L"",
             WS_CHILD | SS_LEFT,  // Hidden initially
-            520, 205, 400, 20,
+            d(520), d(205), d(400), d(20),
             hWnd, (HMENU)(INT_PTR)4019,  // IDC_ART_API_WARNING
             GetModuleHandleW(nullptr), nullptr);
 
         // --- Tab control for art types ---
         gArtTab = CreateWindowW(WC_TABCONTROLW, L"",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED | TCS_FIXEDWIDTH,
-            12, 235, 500, 32,
+            d(12), d(235), d(500), d(32),
             hWnd, (HMENU)(INT_PTR)IDC_ART_TAB,
             GetModuleHandleW(nullptr), nullptr);
         
@@ -5644,7 +6118,7 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         if (gArtTab) {
             SetWindowTheme(gArtTab, L"", L"");
             // Set fixed tab size - must be called after TCS_FIXEDWIDTH is set
-            TabCtrl_SetItemSize(gArtTab, 60, 26);
+            TabCtrl_SetItemSize(gArtTab, d(60), d(26));
             gOriginalTabProc = (WNDPROC)SetWindowLongPtrW(gArtTab, GWLP_WNDPROC, (LONG_PTR)TabSubclassProc);
         }
 
@@ -5681,36 +6155,37 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // Position below the tabs, above the list view
         gArtWebSizeLabel = CreateWindowW(L"STATIC", L"Size:",
             WS_CHILD | WS_VISIBLE,
-            320, 240, 35, 20,
+            d(320), d(240), d(35), d(20),
             hWnd, (HMENU)(INT_PTR)4018,  // IDC_ART_WEB_SIZE_LABEL
             GetModuleHandleW(nullptr), nullptr);
 
         gArtWebResolutionCombo = CreateWindowW(L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
-            355, 237, 90, 200,
+            d(355), d(237), d(110), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_ART_WEB_RES_COMBO,
             GetModuleHandleW(nullptr), nullptr);
 
         // Add resolution options
+        SendMessageW(gArtWebResolutionCombo, CB_ADDSTRING, 0, (LPARAM)L"Not specified");
         SendMessageW(gArtWebResolutionCombo, CB_ADDSTRING, 0, (LPARAM)L"265x265");
         SendMessageW(gArtWebResolutionCombo, CB_ADDSTRING, 0, (LPARAM)L"512x512");
         SendMessageW(gArtWebResolutionCombo, CB_ADDSTRING, 0, (LPARAM)L"1024x1024");
         SendMessageW(gArtWebResolutionCombo, CB_ADDSTRING, 0, (LPARAM)L"2160x2160");
         SendMessageW(gArtWebResolutionCombo, CB_ADDSTRING, 0, (LPARAM)L"4096x4096");
-        SendMessageW(gArtWebResolutionCombo, CB_SETCURSEL, 2, 0);  // Default to 1024x1024
+        SendMessageW(gArtWebResolutionCombo, CB_SETCURSEL, 3, 0);  // Default to 1024x1024
         gArtWebResolution = L"1024x1024";
 
         // Previous page button
         gArtWebPrevBtn = CreateWindowW(L"BUTTON", L"< Prev",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_DISABLED,  // Disabled initially (page 0)
-            450, 237, 50, 24,
+            d(470), d(237), d(50), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_ART_WEB_PREV_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         // Next page button
         gArtWebNextBtn = CreateWindowW(L"BUTTON", L"Next >",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            502, 237, 50, 24,
+            d(524), d(237), d(50), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_ART_WEB_NEXT_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5718,7 +6193,7 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         gArtList = CreateWindowW(WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_ICON | LVS_SINGLESEL | LVS_AUTOARRANGE,
-            12, 270, 500, 270,
+            d(12), d(270), d(500), d(270),
             hWnd, (HMENU)(INT_PTR)IDC_ART_LIST,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5727,14 +6202,14 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // Selected preview label
         CreateWindowW(L"STATIC", L"Selected Preview:",
             WS_CHILD | WS_VISIBLE,
-            530, 225, 130, 18,
+            d(530), d(225), d(130), d(18),
             hWnd, (HMENU)(INT_PTR)IDC_ART_PREVIEW_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         // Selected preview (fills right side)
         gArtPreviewImg = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | WS_BORDER,
-            530, 245, 250, 280,
+            d(530), d(245), d(250), d(280),
             hWnd, (HMENU)(INT_PTR)IDC_ART_PREVIEW_IMG,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5742,13 +6217,13 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         
         CreateWindowW(L"STATIC", L"Debug Log:",
             WS_CHILD | WS_VISIBLE,
-            12, 535, 100, 18,
+            d(12), d(535), d(100), d(18),
             hWnd, (HMENU)(INT_PTR)IDC_ART_DEBUG_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         gArtDebug = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            12, 553, 580, 80,
+            d(12), d(553), d(580), d(80),
             hWnd, (HMENU)(INT_PTR)IDC_ART_DEBUG,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5756,21 +6231,27 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         CreateWindowW(L"BUTTON", L"Apply Selected",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            610, 553, 110, 30,
+            d(610), d(553), d(120), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_ART_APPLY_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
  
+        CreateWindowW(L"BUTTON", L"Apply & Favorite",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            d(610), d(593), d(120), d(30),
+            hWnd, (HMENU)(INT_PTR)IDC_ART_APPLY_FAV_BTN,
+            GetModuleHandleW(nullptr), nullptr);
+
         CreateWindowW(L"BUTTON", L"Cancel",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            610, 593, 110, 30,
+            d(610), d(633), d(120), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_ART_CANCEL_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         // Config button (hidden, shown when API key missing)
         gArtConfigBtn = CreateWindowW(L"BUTTON", L"Open Config",
             WS_CHILD | BS_OWNERDRAW,  // Not visible initially
-            400, 203, 100, 24,
+            d(400), d(203), d(100), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_ART_CONFIG_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -5800,70 +6281,94 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         GetClientRect(hWnd, &rc);
         int w = rc.right - rc.left;
         int h = rc.bottom - rc.top;
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
 
         // Clamp splitter position
-        if (gArtSplitterPos < 150) gArtSplitterPos = 150;
-        if (gArtSplitterPos > w - 300) gArtSplitterPos = w - 300;
+        if (gArtSplitterPos < d(150)) gArtSplitterPos = d(150);
+        if (gArtSplitterPos > w - d(300)) gArtSplitterPos = w - d(300);
 
         // Calculate layout regions
-        int topSectionHeight = 200;
-        int debugHeight = 100;
-        int tabTop = 235;
-        int tabHeight = 32;
-        int listTop = tabTop + tabHeight + 3;  // Add 3px spacing
-        int listHeight = h - listTop - debugHeight - 10;
-        if (listHeight < 100) listHeight = 100;
+        int topSectionHeight = d(200);
+        int debugHeight = d(100);
+        int tabTop = d(235);
+        int tabHeight = d(32);
+        int listTop = tabTop + tabHeight + d(3);  // Add 3px spacing
+        int listHeight = h - listTop - debugHeight - d(10);
+        if (listHeight < d(100)) listHeight = d(100);
 
         // List width = total width minus preview panel minus splitter
-        int listWidth = w - 24 - gArtSplitterPos - SPLITTER_WIDTH;
-        if (listWidth < 200) listWidth = 200;
+        int listWidth = w - d(24) - gArtSplitterPos - SPLITTER_WIDTH;
+        if (listWidth < d(200)) listWidth = d(200);
 
         // Preview panel position
-        int previewLeft = 12 + listWidth + SPLITTER_WIDTH;
-        int previewWidth = w - previewLeft - 12;
-
-        // Info label takes full width minus current art preview and restore button
-        if (gArtInfoLabel) MoveWindow(gArtInfoLabel, 145, 30, w - 145 - 140 - 12, 120, TRUE);
+        int previewLeft = d(12) + listWidth + SPLITTER_WIDTH;
+        int previewWidth = w - previewLeft - d(12);
 
         // Reposition title search field and button at top right
         HWND hTitleEdit = GetDlgItem(hWnd, 4100);
         HWND hTitleSaveBtn = GetDlgItem(hWnd, 4101);
-        int titleEditWidth = 200;
-        int titleBtnWidth = 120;
-        int spacing = 10;
-        int rightEdge = w - 12;
+        int titleEditWidth = d(200);
+        int titleBtnWidth = d(140);
+        int spacing = d(8);
+        int rightEdge = w - d(12);
         int btnLeft = rightEdge - titleBtnWidth;
         int editLeft = btnLeft - spacing - titleEditWidth;
-        if (hTitleEdit) MoveWindow(hTitleEdit, editLeft, 10, titleEditWidth, 24, TRUE);
-        if (hTitleSaveBtn) MoveWindow(hTitleSaveBtn, btnLeft, 10, titleBtnWidth, 24, TRUE);
+
+        // Info label takes full width minus current art preview and right-side buttons
+        if (gArtInfoLabel) MoveWindow(gArtInfoLabel, d(145), d(30), w - d(145) - titleBtnWidth - spacing - d(12), d(120), TRUE);
+
+        if (hTitleEdit) MoveWindow(hTitleEdit, editLeft, d(10), titleEditWidth, d(24), TRUE);
+        if (hTitleSaveBtn) MoveWindow(hTitleSaveBtn, btnLeft, d(10), titleBtnWidth, d(24), TRUE);
         // Move the browse button directly under Save and Search
-        if (gArtBrowseLocalBtn) MoveWindow(gArtBrowseLocalBtn, btnLeft, 40, titleBtnWidth, 24, TRUE);
+        if (gArtBrowseLocalBtn) MoveWindow(gArtBrowseLocalBtn, btnLeft, d(38), titleBtnWidth, d(24), TRUE);
         
         // Status bar spans full width
-        if (gArtStatus) MoveWindow(gArtStatus, 12, 205, w - 24, 20, TRUE);
+        if (gArtStatus) MoveWindow(gArtStatus, d(12), d(205), w - d(24), d(20), TRUE);
         
         // Tab control on the left (above list)
-        if (gArtTab) MoveWindow(gArtTab, 12, tabTop, listWidth, tabHeight, TRUE);
+        if (gArtTab) MoveWindow(gArtTab, d(12), tabTop, listWidth, tabHeight, TRUE);
+        
+        // Web search controls (Size label, resolution combo, prev/next buttons)
+        // Position them right-aligned within the tab row area
+        {
+            int webCtrlY = tabTop + d(3);  // Vertically centered in tab row
+            int comboW = d(110);
+            int btnW = d(50);
+            int gap = d(4);
+            // Right-align within the list area
+            int webRight = d(12) + listWidth;
+            int nextLeft = webRight - btnW;
+            int prevLeft = nextLeft - gap - btnW;
+            int comboLeft = prevLeft - gap - comboW;
+            int labelLeft = comboLeft - d(35);
+            
+            if (gArtWebSizeLabel) MoveWindow(gArtWebSizeLabel, labelLeft, webCtrlY + d(2), d(35), d(20), TRUE);
+            if (gArtWebResolutionCombo) MoveWindow(gArtWebResolutionCombo, comboLeft, webCtrlY, comboW, d(200), TRUE);
+            if (gArtWebPrevBtn) MoveWindow(gArtWebPrevBtn, prevLeft, webCtrlY, btnW, d(24), TRUE);
+            if (gArtWebNextBtn) MoveWindow(gArtWebNextBtn, nextLeft, webCtrlY, btnW, d(24), TRUE);
+        }
         
         // List on the left (below tabs)
-        if (gArtList) MoveWindow(gArtList, 12, listTop, listWidth, listHeight, TRUE);
+        if (gArtList) MoveWindow(gArtList, d(12), listTop, listWidth, listHeight, TRUE);
         
         // Preview label and image on the right
         HWND previewLabel = GetDlgItem(hWnd, IDC_ART_PREVIEW_LABEL);
-        if (previewLabel) MoveWindow(previewLabel, previewLeft, tabTop, previewWidth, 18, TRUE);
-        if (gArtPreviewImg) MoveWindow(gArtPreviewImg, previewLeft, tabTop + 20, previewWidth, listHeight + tabHeight - 20, TRUE);
+        if (previewLabel) MoveWindow(previewLabel, previewLeft, tabTop, previewWidth, d(18), TRUE);
+        if (gArtPreviewImg) MoveWindow(gArtPreviewImg, previewLeft, tabTop + d(20), previewWidth, listHeight + tabHeight - d(20), TRUE);
         
         // Debug section at the bottom
-        int debugTop = listTop + listHeight + 10;
+        int debugTop = listTop + listHeight + d(10);
         HWND debugLabel = GetDlgItem(hWnd, IDC_ART_DEBUG_LABEL);
-        if (debugLabel) MoveWindow(debugLabel, 12, debugTop, 100, 18, TRUE);
-        if (gArtDebug) MoveWindow(gArtDebug, 12, debugTop + 18, w - 150, debugHeight - 28, TRUE);
+        if (debugLabel) MoveWindow(debugLabel, d(12), debugTop, d(100), d(18), TRUE);
+        if (gArtDebug) MoveWindow(gArtDebug, d(12), debugTop + d(18), w - d(150), debugHeight - d(28), TRUE);
         
         // Buttons on the right of debug
         HWND applyBtn = GetDlgItem(hWnd, IDC_ART_APPLY_BTN);
+        HWND applyFavBtn = GetDlgItem(hWnd, IDC_ART_APPLY_FAV_BTN);
         HWND cancelBtn = GetDlgItem(hWnd, IDC_ART_CANCEL_BTN);
-        if (applyBtn) MoveWindow(applyBtn, w - 130, debugTop + 18, 110, 30, TRUE);
-        if (cancelBtn) MoveWindow(cancelBtn, w - 130, debugTop + 53, 110, 30, TRUE);
+        if (applyBtn) MoveWindow(applyBtn, w - d(140), debugTop + d(18), d(120), d(30), TRUE);
+        if (applyFavBtn) MoveWindow(applyFavBtn, w - d(140), debugTop + d(53), d(120), d(30), TRUE);
+        if (cancelBtn) MoveWindow(cancelBtn, w - d(140), debugTop + d(88), d(120), d(30), TRUE);
 
         // Invalidate splitter region for redraw
         InvalidateRect(hWnd, nullptr, TRUE);
@@ -5871,10 +6376,18 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
 
+    case WM_TIMER: {
+        if (w == THUMB_TIMER_ID) {
+            ProcessThumbnailPoll();
+            return 0;
+        }
+        break;
+    }
+
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)l;
-        mmi->ptMinTrackSize.x = 700;
-        mmi->ptMinTrackSize.y = 550;
+        mmi->ptMinTrackSize.x = 800;
+        mmi->ptMinTrackSize.y = 600;
         return 0;
     }
 
@@ -6049,7 +6562,12 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                 NMLISTVIEW* pnmv = (NMLISTVIEW*)l;
                 // Check if selection changed (new state has LVIS_SELECTED)
                 if ((pnmv->uChanged & LVIF_STATE) && (pnmv->uNewState & LVIS_SELECTED)) {
-                    LoadSelectedPreview(pnmv->iItem);
+                    // Use lParam (original gArtImages index) since items may be sorted
+                    LVITEM lvi{};
+                    lvi.mask = LVIF_PARAM;
+                    lvi.iItem = pnmv->iItem;
+                    ListView_GetItem(gArtList, &lvi);
+                    LoadSelectedPreview((int)lvi.lParam);
                 }
             }
         }
@@ -6095,9 +6613,10 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     }
 
     case WM_USER + 1: {
-        // Load images - initial load
+        // Load images - initial load (async game ID lookup)
         gArtImages.clear();
         gArtGameId.clear();
+        ++gArtFetchGeneration;
 
         // If no API key and we're on Web tab, just proceed with web search
         if (gConfig.steamGridDbKey.empty() && gArtCurrentTab == ART_WEB) {
@@ -6124,33 +6643,41 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         SetWindowTextW(gArtStatus, L"Searching for game on SteamGridDB...");
         UpdateWindow(gArtStatus);
 
-        // Determine game ID
-        std::wstring store, rest;
-        if (TrySplitStoreAndRest(gArtCurrentEntry.idStr, store, rest)) {
-            if (store == L"steam" && IsAllDigits(rest)) {
-                // Use Steam app ID to find game
-                gArtGameId = SteamGridDbGetGameIdBySteamAppId(rest, gConfig.steamGridDbKey);
-            }
+        // Launch async game ID lookup
+        {
+            int myFetchGen = gArtFetchGeneration.load();
+            HWND hTarget = hWnd;
+            std::wstring idStr = gArtCurrentEntry.idStr;
+            std::wstring title = gArtCurrentEntry.title;
+            std::wstring apiKey = gConfig.steamGridDbKey;
+            std::thread([hTarget, myFetchGen, idStr, title, apiKey]() {
+                std::wstring gameId;
+                std::wstring store, rest;
+                if (TrySplitStoreAndRest(idStr, store, rest)) {
+                    if (store == L"steam" && IsAllDigits(rest)) {
+                        gameId = SteamGridDbGetGameIdBySteamAppId(rest, apiKey);
+                    }
+                }
+                if (gameId.empty() && !title.empty()) {
+                    gameId = SteamGridDbSearchGame(title, apiKey);
+                }
+                // Post result back to main thread if still valid
+                if (gArtFetchGeneration.load() == myFetchGen && IsWindow(hTarget)) {
+                    // Store game ID and trigger image load
+                    gArtGameId = gameId;
+                    PostMessageW(hTarget, WM_USER + 2, 0, 0);
+                }
+            }).detach();
         }
-
-        // If no direct lookup, search by title
-        if (gArtGameId.empty() && !gArtCurrentEntry.title.empty()) {
-            gArtGameId = SteamGridDbSearchGame(gArtCurrentEntry.title, gConfig.steamGridDbKey);
-        }
-
-        if (gArtGameId.empty()) {
-            SetWindowTextW(gArtStatus, L"Could not find game on SteamGridDB. Try setting a title first.");
-            return 0;
-        }
-
-        // Now load images for current tab
-        PostMessageW(hWnd, WM_USER + 2, 0, 0);
         return 0;
     }
 
     case WM_USER + 2: {
-        // Load images for current art type tab
+        // Load images for current art type tab (async - launches thread, results arrive via WM_USER + 3)
         gArtImages.clear();
+        gArtCancelLoading = true;  // Cancel any in-progress thumbnail loading
+        ++gArtFetchGeneration;
+        int myFetchGen = gArtFetchGeneration.load();
         
         // Clear preview
         if (gArtPreviewBitmap) {
@@ -6160,11 +6687,12 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         gArtSelectedIndex = -1;
         if (gArtPreviewImg) InvalidateRect(gArtPreviewImg, nullptr, TRUE);
 
+        // Clear current list immediately so user sees responsiveness
+        ListView_DeleteAllItems(gArtList);
+        DestroyArtImageList();
+
         // Check if API key is missing - don't change the error message (not needed for Web tab)
         if (gConfig.steamGridDbKey.empty() && gArtCurrentTab != ART_WEB) {
-            // Clear the list but keep the error message
-            ListView_DeleteAllItems(gArtList);
-            DestroyArtImageList();
             return 0;
         }
 
@@ -6173,84 +6701,145 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             return 0;
         }
 
-        const wchar_t* artTypeName = L"";
-        bool isWebSearch = false;
+        // Show loading status immediately
+        bool isWebTab = (gArtCurrentTab == ART_WEB);
+        if (isWebTab) {
+            std::wstring statusMsg = L"Searching web for game art (page " + std::to_wstring(gArtWebPageIndex + 1) + L")...";
+            SetWindowTextW(gArtStatus, statusMsg.c_str());
+        } else {
+            const wchar_t* names[] = { L"web images", L"grids", L"heroes", L"logos", L"icons" };
+            int tabIdx = gArtCurrentTab;
+            if (tabIdx >= 0 && tabIdx <= 4) {
+                std::wstring msg = L"Fetching " + std::wstring(names[tabIdx]) + L" from SteamGridDB...";
+                SetWindowTextW(gArtStatus, msg.c_str());
+            }
+        }
+        UpdateWindow(gArtStatus);
+
+        // Capture state for the background thread
+        HWND hTarget = hWnd;
+        int currentTab = gArtCurrentTab;
+        std::wstring gameId = gArtGameId;
+        std::wstring apiKey = gConfig.steamGridDbKey;
+        std::wstring gameTitle = gArtCurrentEntry.title;
+        int webPageIndex = gArtWebPageIndex;
+        int minImageSize = gConfig.minImageSize;
         
-        switch (gArtCurrentTab) {
-        case ART_GRIDS:
-            artTypeName = L"grids";
-            SetWindowTextW(gArtStatus, L"Fetching grids from SteamGridDB...");
-            UpdateWindow(gArtStatus);
-            gArtImages = SteamGridDbGetGrids(gArtGameId, gConfig.steamGridDbKey);
-            break;
-        case ART_HEROES:
-            artTypeName = L"heroes";
-            SetWindowTextW(gArtStatus, L"Fetching heroes from SteamGridDB...");
-            UpdateWindow(gArtStatus);
-            gArtImages = SteamGridDbGetHeroes(gArtGameId, gConfig.steamGridDbKey);
-            break;
-        case ART_LOGOS:
-            artTypeName = L"logos";
-            SetWindowTextW(gArtStatus, L"Fetching logos from SteamGridDB...");
-            UpdateWindow(gArtStatus);
-            gArtImages = SteamGridDbGetLogos(gArtGameId, gConfig.steamGridDbKey);
-            break;
-        case ART_ICONS:
-            artTypeName = L"icons";
-            SetWindowTextW(gArtStatus, L"Fetching icons from SteamGridDB...");
-            UpdateWindow(gArtStatus);
-            gArtImages = SteamGridDbGetIcons(gArtGameId, gConfig.steamGridDbKey);
-            break;
-        case ART_WEB:
-            isWebSearch = true;
-            artTypeName = L"web images";
-            {
-                std::wstring statusMsg = L"Searching web for game art (page " + std::to_wstring(gArtWebPageIndex + 1) + L")...";
-                SetWindowTextW(gArtStatus, statusMsg.c_str());
+        // Read web resolution from combo on main thread
+        std::wstring webResolution = gArtWebResolution;
+        if (isWebTab) {
+            int sel = (int)SendMessageW(gArtWebResolutionCombo, CB_GETCURSEL, 0, 0);
+            if (sel != CB_ERR) {
+                wchar_t buf[32];
+                SendMessageW(gArtWebResolutionCombo, CB_GETLBTEXT, sel, (LPARAM)buf);
+                webResolution = buf;
+                gArtWebResolution = webResolution;
             }
-            UpdateWindow(gArtStatus);
-            // Get resolution from combo
-            {
-                int sel = (int)SendMessageW(gArtWebResolutionCombo, CB_GETCURSEL, 0, 0);
-                if (sel != CB_ERR) {
-                    wchar_t buf[32];
-                    SendMessageW(gArtWebResolutionCombo, CB_GETLBTEXT, sel, (LPARAM)buf);
-                    gArtWebResolution = buf;
-                }
-            }
-            gArtImages = WebSearchGameImages(gArtCurrentEntry.title, gArtWebResolution, gArtWebPageIndex);
-            // Update button states
-            EnableWindow(gArtWebPrevBtn, gArtWebPageIndex > 0);
-            // Disable next if no results found (end of results)
-            gArtWebNoMoreResults = gArtImages.empty();
-            EnableWindow(gArtWebNextBtn, !gArtWebNoMoreResults);
-            break;
         }
 
-        // Filter out small/blurry images based on minImageSize setting (skip for web search, already filtered)
-        size_t totalBeforeFilter = gArtImages.size();
-        size_t filteredOut = 0;
-        if (!isWebSearch) {
-            gArtImages = FilterImagesBySize(gArtImages, gConfig.minImageSize);
-            filteredOut = totalBeforeFilter - gArtImages.size();
+        // Launch async fetch thread
+        std::thread([hTarget, myFetchGen, currentTab, gameId, apiKey, gameTitle,
+                     webPageIndex, webResolution, minImageSize]() {
+            std::vector<SteamGridDbImage> images;
+            bool isWebSearch = false;
+
+            // Check if still valid before starting
+            if (gArtFetchGeneration.load() != myFetchGen) return;
+
+            switch (currentTab) {
+            case ART_GRIDS:
+                images = SteamGridDbGetGrids(gameId, apiKey);
+                break;
+            case ART_HEROES:
+                images = SteamGridDbGetHeroes(gameId, apiKey);
+                break;
+            case ART_LOGOS:
+                images = SteamGridDbGetLogos(gameId, apiKey);
+                break;
+            case ART_ICONS:
+                images = SteamGridDbGetIcons(gameId, apiKey);
+                break;
+            case ART_WEB:
+                isWebSearch = true;
+                images = WebSearchGameImages(gameTitle, webResolution, webPageIndex);
+                break;
+            }
+
+            // Check if still valid after HTTP call
+            if (gArtFetchGeneration.load() != myFetchGen) return;
+
+            // Filter out small images (skip for web search, already filtered)
+            if (!isWebSearch) {
+                images = FilterImagesBySize(images, minImageSize);
+            }
+
+            // Store results in a heap-allocated struct and post to main thread
+            struct FetchResult {
+                std::vector<SteamGridDbImage> images;
+                int fetchGen;
+                int tab;
+                bool isWebSearch;
+                int webPageIndex;
+            };
+            auto* result = new FetchResult{ std::move(images), myFetchGen, currentTab, isWebSearch, webPageIndex };
+            if (IsWindow(hTarget) && gArtFetchGeneration.load() == myFetchGen) {
+                PostMessageW(hTarget, WM_USER + 3, 0, (LPARAM)result);
+            } else {
+                delete result;
+            }
+        }).detach();
+
+        // Update web button states immediately (for web tab)
+        if (isWebTab) {
+            EnableWindow(gArtWebPrevBtn, gArtWebPageIndex > 0);
+        }
+
+        return 0;
+    }
+
+    case WM_USER + 3: {
+        // Receive async fetch results on main thread
+        struct FetchResult {
+            std::vector<SteamGridDbImage> images;
+            int fetchGen;
+            int tab;
+            bool isWebSearch;
+            int webPageIndex;
+        };
+        auto* result = reinterpret_cast<FetchResult*>(l);
+        if (!result) return 0;
+
+        // Discard if stale (user already switched tabs again)
+        if (result->fetchGen != gArtFetchGeneration.load()) {
+            delete result;
+            return 0;
+        }
+
+        gArtImages = std::move(result->images);
+        bool isWebSearch = result->isWebSearch;
+        int webPageIndex = result->webPageIndex;
+        int tab = result->tab;
+        delete result;
+
+        // Update web button states
+        if (isWebSearch) {
+            gArtWebNoMoreResults = gArtImages.empty();
+            EnableWindow(gArtWebNextBtn, !gArtWebNoMoreResults);
         }
 
         if (gArtImages.empty()) {
             std::wstring msg;
             if (isWebSearch) {
-                if (gArtWebPageIndex == 0) {
+                if (webPageIndex == 0) {
                     msg = L"No web images found for \"" + gArtCurrentEntry.title + L"\".";
                 } else {
-                    msg = L"No more results on page " + std::to_wstring(gArtWebPageIndex + 1) + L".";
+                    msg = L"No more results on page " + std::to_wstring(webPageIndex + 1) + L".";
                 }
             } else {
-                msg = L"No " + std::wstring(artTypeName) + L" found for this game on SteamGridDB.";
-                if (filteredOut > 0) {
-                    msg += L" (" + std::to_wstring(filteredOut) + L" images filtered out as too small)";
-                }
+                const wchar_t* names[] = { L"web images", L"grids", L"heroes", L"logos", L"icons" };
+                msg = L"No " + std::wstring(names[tab]) + L" found for this game on SteamGridDB.";
             }
             SetWindowTextW(gArtStatus, msg.c_str());
-            // Clear the list
             ListView_DeleteAllItems(gArtList);
             DestroyArtImageList();
             return 0;
@@ -6258,12 +6847,10 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         std::wstring statusText;
         if (isWebSearch) {
-            statusText = L"Page " + std::to_wstring(gArtWebPageIndex + 1) + L": Found " + std::to_wstring(gArtImages.size()) + L" " + artTypeName;
+            statusText = L"Page " + std::to_wstring(webPageIndex + 1) + L": Found " + std::to_wstring(gArtImages.size()) + L" web images";
         } else {
-            statusText = L"Found " + std::to_wstring(gArtImages.size()) + L" " + artTypeName;
-            if (filteredOut > 0) {
-                statusText += L" (" + std::to_wstring(filteredOut) + L" too small)";
-            }
+            const wchar_t* names[] = { L"web images", L"grids", L"heroes", L"logos", L"icons" };
+            statusText = L"Found " + std::to_wstring(gArtImages.size()) + L" " + std::wstring(names[tab]);
         }
         statusText += L". Loading thumbnails...";
         SetWindowTextW(gArtStatus, statusText.c_str());
@@ -6323,6 +6910,8 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
                     }
                     // Save cache and refresh
                     SaveUiStateToCacheFile();
+                    // Local file applied - no web URL to track
+                    gArtLastAppliedWebUrl.clear();
                     // Clear pending local image and preview bitmap
                     gArtPendingLocalImagePath.clear();
                     if (gArtPreviewBitmap) {
@@ -6346,6 +6935,161 @@ static LRESULT CALLBACK ArtWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
         if (id == IDC_ART_CANCEL_BTN) {
             CloseArtWindow(false);
+            return 0;
+        }
+        if (id == IDC_ART_APPLY_FAV_BTN) {
+            // Apply the selected/pending image AND set it as favorite in one action
+            std::wstring fileName = gArtCurrentEntry.expectedFileName;
+            if (fileName.empty()) fileName = ExpectedPngFromManifestId(gArtCurrentEntry.store, gArtCurrentEntry.idStr);
+
+            if (!gArtPendingLocalImagePath.empty()) {
+                // Local image path - apply it first
+                std::wstring pickedPath = gArtPendingLocalImagePath;
+                std::wstring basePath = GetThirdPartyLibrariesPath();
+                fs::path storePath = fs::path(basePath) / gArtCurrentEntry.store;
+                fs::path destPath = storePath / fileName;
+                if (!fs::exists(storePath)) fs::create_directories(storePath);
+                if (gArtCurrentEntry.hasArt && !gArtCurrentEntry.filePath.empty() && fs::exists(gArtCurrentEntry.filePath)) {
+                    BackupOriginalArt(gArtCurrentEntry.store, gArtCurrentEntry.filePath, fileName);
+                }
+                if (fs::exists(destPath)) {
+                    DWORD attrs = GetFileAttributesW(destPath.c_str());
+                    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY))
+                        SetFileAttributesW(destPath.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                }
+                try {
+                    fs::copy_file(pickedPath, destPath, fs::copy_options::overwrite_existing);
+                    SetFileReadOnly(destPath.wstring());
+                } catch (...) {
+                    DarkMessageBox(hWnd, L"Failed to copy the selected image.", L"Copy Failed", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                // Save as favorite (file-based, no URL)
+                if (!SaveFavoriteArt(gArtCurrentEntry.store, pickedPath, fileName)) {
+                    DarkMessageBox(hWnd, L"Art applied but failed to save favorite.", L"Error", MB_OK | MB_ICONERROR);
+                }
+                // Update entries
+                for (auto& e : gLastItems) {
+                    if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) {
+                        e.hasArt = true;
+                        e.filePath = destPath.wstring();
+                        e.fileName = fileName;
+                        e.hasFavorite = true;
+                        e.favoriteWebUrl.clear();
+                        break;
+                    }
+                }
+                HWND hEdit = GetDlgItem(gArtWnd, 4100);
+                if (hEdit) {
+                    wchar_t titleBuf[256] = {};
+                    GetWindowTextW(hEdit, titleBuf, _countof(titleBuf));
+                    for (auto& e : gLastItems) {
+                        if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) { e.customTitle = titleBuf; break; }
+                    }
+                }
+                SaveUiStateToCacheFile();
+                gArtLastAppliedWebUrl.clear();
+                gArtPendingLocalImagePath.clear();
+                if (gArtPreviewBitmap) { DeleteObject(gArtPreviewBitmap); gArtPreviewBitmap = nullptr; }
+                CloseArtWindow(false);
+                DestroyImageList();
+                EnsureImageList();
+                PopulateListFromItems(gLastItems);
+            } else if (gArtSelectedIndex >= 0 && gArtSelectedIndex < (int)gArtImages.size()) {
+                // Web/API image - download, apply, and save as favorite
+                const SteamGridDbImage& img = gArtImages[gArtSelectedIndex];
+                std::vector<unsigned char> data;
+                SetWindowTextW(gArtStatus, L"Downloading image...");
+                if (!HttpDownloadBinaryCached(img.url, data, gArtGameId) || data.empty()) {
+                    SetWindowTextW(gArtStatus, L"Failed to download image.");
+                    DarkMessageBox(hWnd, L"Failed to download the selected image.", L"Download Error", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                // Apply the art
+                std::wstring basePath = GetThirdPartyLibrariesPath();
+                fs::path storePath = fs::path(basePath) / gArtCurrentEntry.store;
+                fs::path savePath = storePath / fileName;
+                if (!fs::exists(storePath)) fs::create_directories(storePath);
+                if (gArtCurrentEntry.hasArt && !gArtCurrentEntry.filePath.empty())
+                    BackupOriginalArt(gArtCurrentEntry.store, gArtCurrentEntry.filePath, fileName);
+                RemoveFileReadOnly(savePath.wstring());
+                HANDLE hFile = CreateFileW(savePath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile == INVALID_HANDLE_VALUE) {
+                    DarkMessageBox(hWnd, L"Failed to save the image file.", L"Save Error", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                DWORD written = 0;
+                WriteFile(hFile, data.data(), (DWORD)data.size(), &written, nullptr);
+                CloseHandle(hFile);
+                SetFileReadOnly(savePath.wstring());
+                // Save as favorite
+                fs::path favDir = fs::path(GetFavoriteArtPath()) / gArtCurrentEntry.store;
+                if (!fs::exists(favDir)) fs::create_directories(favDir);
+                fs::path favPath = favDir / fileName;
+                HANDLE hFav = CreateFileW(favPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFav != INVALID_HANDLE_VALUE) {
+                    WriteFile(hFav, data.data(), (DWORD)data.size(), &written, nullptr);
+                    CloseHandle(hFav);
+                }
+                // Update entries
+                for (auto& e : gLastItems) {
+                    if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) {
+                        e.hasArt = true;
+                        e.filePath = savePath.wstring();
+                        e.fileName = fileName;
+                        e.hasFavorite = true;
+                        e.favoriteWebUrl = img.url;
+                        break;
+                    }
+                }
+                HWND hEdit = GetDlgItem(gArtWnd, 4100);
+                if (hEdit) {
+                    wchar_t titleBuf[256] = {};
+                    GetWindowTextW(hEdit, titleBuf, _countof(titleBuf));
+                    for (auto& e : gLastItems) {
+                        if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) { e.customTitle = titleBuf; break; }
+                    }
+                }
+                SaveUiStateToCacheFile();
+                gArtLastAppliedWebUrl = img.url;
+                DarkMessageBox(hWnd, L"Art applied and set as favorite!\n\nQuick Apply with \"Keep Favorites\" will reuse it.", L"Success", MB_OK | MB_ICONINFORMATION);
+                CloseArtWindow(false);
+                DestroyImageList();
+                EnsureImageList();
+                PopulateListFromItems(gLastItems);
+            } else {
+                DarkMessageBox(hWnd, L"No image selected.\n\nSelect an image from the list or browse a local image first.", L"No Selection", MB_OK | MB_ICONINFORMATION);
+            }
+            return 0;
+        }
+        if (id == IDC_ART_SET_FAV_BTN) {
+            // Set the currently applied art as favorite
+            std::wstring fileName = gArtCurrentEntry.expectedFileName;
+            if (fileName.empty()) fileName = ExpectedPngFromManifestId(gArtCurrentEntry.store, gArtCurrentEntry.idStr);
+
+            if (!gArtCurrentEntry.hasArt || gArtCurrentEntry.filePath.empty() || !fs::exists(gArtCurrentEntry.filePath)) {
+                DarkMessageBox(hWnd, L"No art is currently applied to this game.\n\nApply art first, then set it as favorite.", L"No Art", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+
+            // Save the current art file as favorite
+            if (!SaveFavoriteArt(gArtCurrentEntry.store, gArtCurrentEntry.filePath, fileName)) {
+                DarkMessageBox(hWnd, L"Failed to save the favorite image.", L"Error", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+
+            // Update entries - use tracked URL if the art was applied from web
+            for (auto& e : gLastItems) {
+                if (e.store == gArtCurrentEntry.store && e.idStr == gArtCurrentEntry.idStr) {
+                    e.hasFavorite = true;
+                    e.favoriteWebUrl = gArtLastAppliedWebUrl; // empty if local file
+                    break;
+                }
+            }
+            SaveUiStateToCacheFile();
+            SetWindowTextW(gArtStatus, L"\u2605 Favorite set!");
+            DarkMessageBox(hWnd, L"Current art has been set as the favorite for this game.\n\nQuick Apply with \"Keep Favorites\" will reuse it.", L"Favorite Set", MB_OK | MB_ICONINFORMATION);
+            PopulateListFromItems(gLastItems);
             return 0;
         }
         if (id == IDC_ART_RESTORE_BTN) {
@@ -6481,6 +7225,8 @@ static void CloseArtWindow(bool applyChanges) {
     // Cancel any loading in progress
     gArtCancelLoading = true;
     gArtIsLoading = false;
+    if (gThumbState) { gThumbState->cancelFlag.store(true); gThumbState.reset(); }
+    KillTimer(gArtWnd, THUMB_TIMER_ID);
 
     EnableWindow(gArtParent, TRUE);
     SetForegroundWindow(gArtParent);
@@ -6539,7 +7285,8 @@ static void OpenArtWindow(HWND parent, const GameEntry& entry) {
 
     RECT pr{};
     GetWindowRect(parent, &pr);
-    int w = 950, h = 750;
+    UINT sysDpiArt = GetDpiForSystem();
+    int w = MulDiv(950, sysDpiArt, 96), h = MulDiv(750, sysDpiArt, 96);
     int x = pr.left + ((pr.right - pr.left) - w) / 2;
     int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
 
@@ -6658,47 +7405,48 @@ static void CloseConfigWindow(bool applyChanges) {
 static LRESULT CALLBACK ConfigWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE: {
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT hFont = CreateDpiFont(hWnd);
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
 
         CreateWindowW(L"STATIC", L"SteamGridDB API Key:",
             WS_CHILD | WS_VISIBLE,
-            12, 14, 160, 20,
+            d(12), d(14), d(160), d(20),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_KEY_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         gCfgKeyEdit = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            12, 36, 540, 24,
+            d(12), d(36), d(540), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_KEY_EDIT,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"STATIC", L"ThirdPartyLibraries base path (optional):",
             WS_CHILD | WS_VISIBLE,
-            12, 74, 320, 20,
+            d(12), d(74), d(320), d(20),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_PATH_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         gCfgPathEdit = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            12, 96, 470, 24,
+            d(12), d(96), d(470), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_PATH_EDIT,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"BUTTON", L"Browse...",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            490, 96, 62, 24,
+            d(490), d(96), d(62), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_BROWSE_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"STATIC", L"Theme:",
             WS_CHILD | WS_VISIBLE,
-            12, 136, 50, 20,
+            d(12), d(136), d(50), d(20),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_THEME_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         gCfgTheme = CreateWindowW(WC_COMBOBOXW, L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            70, 132, 120, 200,
+            d(70), d(132), d(120), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_CMB_THEME,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gCfgTheme, CB_ADDSTRING, 0, (LPARAM)L"Dark");
@@ -6707,13 +7455,13 @@ static LRESULT CALLBACK ConfigWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         CreateWindowW(L"STATIC", L"Parallel Downloads:",
             WS_CHILD | WS_VISIBLE,
-            210, 136, 130, 20,
+            d(210), d(136), d(130), d(20),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_PARALLEL_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         gCfgParallel = CreateWindowW(WC_COMBOBOXW, L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            340, 132, 80, 200,
+            d(340), d(132), d(80), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_CMB_PARALLEL,
             GetModuleHandleW(nullptr), nullptr);
         // Add options: Auto, 2, 4, 6, 8, ... up to CPU thread count
@@ -6739,13 +7487,13 @@ static LRESULT CALLBACK ConfigWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         CreateWindowW(L"STATIC", L"Min Image Size (px):",
             WS_CHILD | WS_VISIBLE,
-            12, 168, 130, 20,
+            d(12), d(168), d(130), d(20),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_MINSIZE_LABEL,
             GetModuleHandleW(nullptr), nullptr);
 
         gCfgMinSizeEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_NUMBER,
-            145, 166, 60, 22,
+            d(145), d(166), d(60), d(22),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_MINSIZE_EDIT,
             GetModuleHandleW(nullptr), nullptr);
         wchar_t minSizeBuf[16];
@@ -6754,25 +7502,25 @@ static LRESULT CALLBACK ConfigWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         CreateWindowW(L"BUTTON", L"Clear Image Cache",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            12, 202, 130, 28,
+            d(12), d(202), d(130), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_CLEAR_CACHE_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"BUTTON", L"Restore Original Art",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            152, 202, 145, 28,
+            d(152), d(202), d(145), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_RESTORE_ART_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"BUTTON", L"Cancel",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            372, 242, 80, 28,
+            d(372), d(242), d(80), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_CANCEL_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            472, 242, 80, 28,
+            d(472), d(242), d(80), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_CFG_OK_BTN,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -6936,7 +7684,8 @@ static void OpenConfigWindow(HWND parent) {
 
     RECT pr{};
     GetWindowRect(parent, &pr);
-    int w = 580, h = 325;
+    UINT sysDpi = GetDpiForSystem();
+    int w = MulDiv(580, sysDpi, 96), h = MulDiv(325, sysDpi, 96);
     int x = pr.left + ((pr.right - pr.left) - w) / 2;
     int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
 
@@ -7008,7 +7757,7 @@ static LRESULT CALLBACK HelpWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         helpText += L"XBOX APP ART UPDATER - HELP & FAQ\r\n";
         helpText += L"==================================\r\n\r\n";
         helpText += L"QUICK START - AUTOMATED WEB SEARCH:\r\n\r\n";
-        helpText += L"Quick Apply now includes automatic web search using Google Images.\r\n";
+        helpText += L"Quick Apply now includes automatic web search using DuckDuckGo Images.\r\n";
         helpText += L"When enabled, it fetches game covers directly from the web without\r\n";
         helpText += L"needing a SteamGridDB API key.\r\n\r\n";
         helpText += L"IMPORTANT NOTES ABOUT WEB SEARCH:\r\n";
@@ -7070,7 +7819,7 @@ static LRESULT CALLBACK HelpWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         helpText += L"- Select one or more games in the list\r\n";
         helpText += L"- Click \"Quick Apply\" to apply art automatically\r\n";
         helpText += L"- Choose sources: Web Search, Grids, Heroes, Logos, Icons\r\n";
-        helpText += L"- Web Search: Automatic Google Images search (may be unpredictable)\r\n";
+        helpText += L"- Web Search: Automatic DuckDuckGo image search\r\n";
         helpText += L"  * Random: Picks a random result from search\r\n";
         helpText += L"  * Result #: Select specific result (1=first, usually best)\r\n";
         helpText += L"  * First 3 results are typically most accurate\r\n";
@@ -7097,10 +7846,11 @@ static LRESULT CALLBACK HelpWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         helpText += L"Art Backups Location:\r\n";
         helpText += backupPath;
         
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
         // Create a simple multiline edit control (easier to style)
         gHelpEdit = CreateWindowW(L"EDIT", helpText.c_str(),
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            10, 10, 560, 420,
+            d(10), d(10), d(560), d(420),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         
         // Apply dark mode theme to the edit control for dark scrollbar
@@ -7110,10 +7860,10 @@ static LRESULT CALLBACK HelpWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         
         CreateWindowW(L"BUTTON", L"Close",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            250, 440, 80, 28,
+            d(250), d(440), d(80), d(28),
             hWnd, (HMENU)1, GetModuleHandleW(nullptr), nullptr);
         
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT hFont = CreateDpiFont(hWnd);
         for (HWND c = GetWindow(hWnd, GW_CHILD); c != nullptr; c = GetWindow(c, GW_HWNDNEXT)) {
             SendMessageW(c, WM_SETFONT, (WPARAM)hFont, TRUE);
         }
@@ -7208,7 +7958,8 @@ static void ShowHelpDialog(HWND parent) {
     wc.hIconSm = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
     RegisterClassExW(&wc);
     
-    int w = 590, h = 510;
+    UINT sysDpi2 = GetDpiForSystem();
+    int w = MulDiv(590, sysDpi2, 96), h = MulDiv(510, sysDpi2, 96);
     RECT parentRc;
     GetWindowRect(parent, &parentRc);
     int x = parentRc.left + (parentRc.right - parentRc.left - w) / 2;
@@ -7301,38 +8052,39 @@ static void UpdateProfileDetails() {
 static LRESULT CALLBACK ProfilesWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE: {
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT hFont = CreateDpiFont(hWnd);
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
         
         CreateWindowW(L"STATIC", L"Saved Profiles:",
             WS_CHILD | WS_VISIBLE,
-            12, 10, 100, 20,
+            d(12), d(10), d(100), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         
         gProfilesList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY,
-            12, 32, 250, 200,
+            d(12), d(32), d(250), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILES_LIST,
             GetModuleHandleW(nullptr), nullptr);
         
         CreateWindowW(L"STATIC", L"Profile Details:",
             WS_CHILD | WS_VISIBLE,
-            275, 10, 100, 20,
+            d(275), d(10), d(100), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         
         gProfileDetailsEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            275, 32, 305, 200,
+            d(275), d(32), d(305), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILE_DETAILS_EDIT,
             GetModuleHandleW(nullptr), nullptr);
         
         CreateWindowW(L"STATIC", L"New Profile Name:",
             WS_CHILD | WS_VISIBLE,
-            12, 245, 120, 20,
+            d(12), d(245), d(120), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         
         gProfileNameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            12, 267, 180, 24,
+            d(12), d(267), d(180), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILE_NAME_EDIT,
             GetModuleHandleW(nullptr), nullptr);
         
@@ -7341,25 +8093,25 @@ static LRESULT CALLBACK ProfilesWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         
         CreateWindowW(L"BUTTON", L"Create Profile",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            200, 265, 120, 28,
+            d(200), d(265), d(120), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILE_CREATE_BTN,
             GetModuleHandleW(nullptr), nullptr);
         
         CreateWindowW(L"BUTTON", L"Restore Selected",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            335, 265, 120, 28,
+            d(335), d(265), d(120), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILE_RESTORE_BTN,
             GetModuleHandleW(nullptr), nullptr);
         
         CreateWindowW(L"BUTTON", L"Delete Selected",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            460, 265, 120, 28,
+            d(460), d(265), d(120), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILE_DELETE_BTN,
             GetModuleHandleW(nullptr), nullptr);
         
         CreateWindowW(L"BUTTON", L"Close",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            500, 308, 80, 28,
+            d(500), d(308), d(80), d(28),
             hWnd, (HMENU)(INT_PTR)IDC_PROFILE_CLOSE_BTN,
             GetModuleHandleW(nullptr), nullptr);
         
@@ -7570,7 +8322,8 @@ static void ShowProfilesDialog(HWND parent) {
     
     RECT pr{};
     GetWindowRect(parent, &pr);
-    int w = 600, h = 380;
+    UINT sysDpi3 = GetDpiForSystem();
+    int w = MulDiv(600, sysDpi3, 96), h = MulDiv(380, sysDpi3, 96);
     int x = pr.left + ((pr.right - pr.left) - w) / 2;
     int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
     
@@ -7594,38 +8347,40 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
     case WM_CREATE: {
         InitCommonControls();
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
+        HFONT hDpiFont = CreateDpiFont(hWnd);
 
         CreateWindowW(L"STATIC", L"Icon size:",
             WS_CHILD | WS_VISIBLE,
-            10, 14, 70, 20,
+            d(10), d(14), d(70), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         gCmbSize = CreateWindowW(WC_COMBOBOXW, L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            85, 10, 90, 200,
+            d(85), d(10), d(90), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_CMB_SIZE,
             GetModuleHandleW(nullptr), nullptr);
 
         CreateWindowW(L"STATIC", L"Layout:",
             WS_CHILD | WS_VISIBLE,
-            190, 14, 50, 20,
+            d(190), d(14), d(50), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         gCmbLayout = CreateWindowW(WC_COMBOBOXW, L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            245, 10, 120, 200,
+            d(245), d(10), d(120), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_CMB_LAYOUT,
             GetModuleHandleW(nullptr), nullptr);
 
         // Filter controls
         CreateWindowW(L"STATIC", L"Store:",
             WS_CHILD | WS_VISIBLE,
-            380, 14, 40, 20,
+            d(380), d(14), d(40), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         gCmbStore = CreateWindowW(WC_COMBOBOXW, L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            425, 10, 90, 200,
+            d(425), d(10), d(90), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_CMB_STORE,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gCmbStore, CB_ADDSTRING, 0, (LPARAM)L"All");
@@ -7637,27 +8392,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
 
         CreateWindowW(L"STATIC", L"Art:",
             WS_CHILD | WS_VISIBLE,
-            525, 14, 30, 20,
+            d(525), d(14), d(30), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         gCmbArtFilter = CreateWindowW(WC_COMBOBOXW, L"",
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            560, 10, 100, 200,
+            d(560), d(10), d(100), d(200),
             hWnd, (HMENU)(INT_PTR)IDC_CMB_ART_FILTER,
             GetModuleHandleW(nullptr), nullptr);
         SendMessageW(gCmbArtFilter, CB_ADDSTRING, 0, (LPARAM)L"All");
         SendMessageW(gCmbArtFilter, CB_ADDSTRING, 0, (LPARAM)L"Has Art");
         SendMessageW(gCmbArtFilter, CB_ADDSTRING, 0, (LPARAM)L"Missing Art");
+        SendMessageW(gCmbArtFilter, CB_ADDSTRING, 0, (LPARAM)L"Favorites");
+        SendMessageW(gCmbArtFilter, CB_ADDSTRING, 0, (LPARAM)L"No Favorites");
         SendMessageW(gCmbArtFilter, CB_SETCURSEL, 0, 0);
 
         CreateWindowW(L"STATIC", L"Search:",
             WS_CHILD | WS_VISIBLE,
-            675, 14, 48, 20,
+            d(675), d(14), d(48), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
         gSearchEdit = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            728, 10, 150, 24,
+            d(728), d(10), d(150), d(24),
             hWnd, (HMENU)(INT_PTR)IDC_SEARCH_EDIT,
             GetModuleHandleW(nullptr), nullptr);
         SetEditPlaceholder(gSearchEdit, L"Search games...");
@@ -7665,25 +8422,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         // Right-aligned buttons (will be repositioned in WM_SIZE)
         gBtnHelp = CreateWindowW(L"BUTTON", L"Help",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 10, 60, 30,
+            0, d(10), d(60), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_BTN_HELP,
             GetModuleHandleW(nullptr), nullptr);
 
         gBtnConfig = CreateWindowW(L"BUTTON", L"Config",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 10, 80, 30,
+            0, d(10), d(80), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_BTN_CONFIG,
             GetModuleHandleW(nullptr), nullptr);
 
         gBtnScan = CreateWindowW(L"BUTTON", L"Scan",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 10, 80, 30,
+            0, d(10), d(80), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_BTN_SCAN,
             GetModuleHandleW(nullptr), nullptr);
 
         gBtnQuickApply = CreateWindowW(L"BUTTON", L"Quick Apply",
             WS_CHILD | BS_OWNERDRAW,  // Hidden initially, shown after scan
-            0, 10, 90, 30,
+            0, d(10), d(90), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_BTN_QUICK_APPLY,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -7691,26 +8448,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         gListInstructionNote = CreateWindowW(L"STATIC", 
             L"Tip: Double-click a game to customize it. Use CTRL to select multiple games for Quick Apply.",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
-            10, 90, 800, 20,
+            d(10), d(90), d(800), d(20),
             hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 
 
         // Create unresolved checkbox above Select All, under icon size
         gChkUnresolved = CreateWindowW(L"BUTTON", L"Show unresolved titles",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            10, 35, 200, 20,
+            d(10), d(35), d(200), d(20),
             hWnd, (HMENU)11001, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(gChkUnresolved, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        SendMessageW(gChkUnresolved, WM_SETFONT, (WPARAM)hDpiFont, TRUE);
 
         gBtnSelectAll = CreateWindowW(L"BUTTON", L"Select All",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            10, 80, 80, 30,
+            d(10), d(80), d(80), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_BTN_SELECT_ALL,
             GetModuleHandleW(nullptr), nullptr);
 
         gBtnProfiles = CreateWindowW(L"BUTTON", L"Profiles",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 10, 75, 30,
+            0, d(10), d(75), d(30),
             hWnd, (HMENU)(INT_PTR)IDC_BTN_PROFILES,
             GetModuleHandleW(nullptr), nullptr);
 
@@ -7739,6 +8496,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
         }
 
         InitCombosAndDefaults();
+
+        // Apply DPI-scaled font to all child controls
+        for (HWND c = GetWindow(hWnd, GW_CHILD); c != nullptr; c = GetWindow(c, GW_HWNDNEXT)) {
+            SendMessageW(c, WM_SETFONT, (WPARAM)hDpiFont, TRUE);
+        }
 
         RecreateListView(hWnd);
         
@@ -7945,30 +8707,31 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     case WM_SIZE: {
         int wdt = LOWORD(l);
         int hgt = HIWORD(l);
+        auto d = [hWnd](int v) { return DpiScale(v, hWnd); };
         
         // Position buttons to the right side
         if (gBtnHelp) {
-            MoveWindow(gBtnHelp, wdt - 350, 10, 60, 30, TRUE);
+            MoveWindow(gBtnHelp, wdt - d(350), d(10), d(60), d(30), TRUE);
         }
         if (gBtnScan) {
-            MoveWindow(gBtnScan, wdt - 280, 10, 80, 30, TRUE);
+            MoveWindow(gBtnScan, wdt - d(280), d(10), d(80), d(30), TRUE);
         }
         if (gBtnConfig) {
-            MoveWindow(gBtnConfig, wdt - 190, 10, 80, 30, TRUE);
+            MoveWindow(gBtnConfig, wdt - d(190), d(10), d(80), d(30), TRUE);
         }
         if (gBtnProfiles) {
-            MoveWindow(gBtnProfiles, wdt - 100, 10, 75, 30, TRUE);
+            MoveWindow(gBtnProfiles, wdt - d(100), d(10), d(75), d(30), TRUE);
         }
         
         // Position Select All and Quick Apply buttons on the left below filters
         if (gBtnSelectAll) {
-            MoveWindow(gBtnSelectAll, 10, 80, 80, 30, TRUE);
+            MoveWindow(gBtnSelectAll, d(10), d(80), d(80), d(30), TRUE);
         }
         if (gChkUnresolved) {
-            MoveWindow(gChkUnresolved, 10, 35, 200, 20, TRUE);
+            MoveWindow(gChkUnresolved, d(10), d(35), d(200), d(20), TRUE);
         }
         if (gBtnQuickApply) {
-            MoveWindow(gBtnQuickApply, wdt - 100, 50, 90, 30, TRUE);
+            MoveWindow(gBtnQuickApply, wdt - d(100), d(50), d(90), d(30), TRUE);
         }
         
         // Resize status bar first (it auto-sizes)
@@ -7982,24 +8745,24 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
             
             // Resize instruction note
             if (gListInstructionNote) {
-                MoveWindow(gListInstructionNote, 10, 90, wdt - 20, 20, TRUE);
+                MoveWindow(gListInstructionNote, d(10), d(90), wdt - d(20), d(20), TRUE);
             }
             
             if (gList) {
-                MoveWindow(gList, 10, 115, wdt - 20, hgt - 125 - sbHeight, TRUE);
+                MoveWindow(gList, d(10), d(115), wdt - d(20), hgt - d(125) - sbHeight, TRUE);
             }
             
             // Center the no-scan message in the list area
             if (gNoScanMessage) {
-                int msgW = 500;
-                int msgH = 180;
-                int listH = hgt - 125 - sbHeight;
-                int msgX = 10 + (wdt - 20 - msgW) / 2;
-                int msgY = 115 + (listH - msgH) / 2;
+                int msgW = d(500);
+                int msgH = d(180);
+                int listH = hgt - d(125) - sbHeight;
+                int msgX = d(10) + (wdt - d(20) - msgW) / 2;
+                int msgY = d(115) + (listH - msgH) / 2;
                 MoveWindow(gNoScanMessage, msgX, msgY, msgW, msgH, TRUE);
             }
         } else if (gList) {
-            MoveWindow(gList, 10, 115, wdt - 20, hgt - 125, TRUE);
+            MoveWindow(gList, d(10), d(115), wdt - d(20), hgt - d(125), TRUE);
         }
         return 0;
     }
@@ -8117,7 +8880,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, PWSTR, int nCmd) {
         wc.lpszClassName, APP_TITLE,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        1300, 820,
+        MulDiv(1300, GetDpiForSystem(), 96), MulDiv(820, GetDpiForSystem(), 96),
         nullptr, nullptr, h, nullptr);
 
     ShowWindow(wnd, nCmd);
